@@ -114,9 +114,10 @@ GatewayAPI::GatewayAPI(Application& app)
     if (allowed_cidr_.empty())
         log_.warn("GatewayAPI: allowed_cidr is empty — every /register will be refused with 403");
 
-    // The audience lives in oauth2/default.json (section `gateway`, client_id
-    // gateway-${DOMAIN}, secret from CLIENT_SECRET_GATEWAY). Providers are loaded
-    // in load_config() before on_worker_start(), so this reads the final set.
+    // The audience is a provider of oauth2/*.json — by default `service`, the
+    // client_credentials client every deployment has already. Providers are
+    // loaded in load_config() before on_worker_start(), so this reads the
+    // final set.
     // Nothing here fails open: verify_jwt throws on an empty secret and
     // check_gateway_token answers "unauthorized" to an unknown audience — but
     // an image shipped without the secret would then refuse every module with

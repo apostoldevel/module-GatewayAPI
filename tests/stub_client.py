@@ -7,7 +7,7 @@ purpose.
 Run (the gateway listens on 127.0.0.1:4988, audience from `module.GatewayAPI.audience`):
 
     python3 tests/stub_client.py --gateway http://127.0.0.1:4988 \
-        --client-id gateway-example.com --client-secret-file /path/to/secret
+        --client-id service-example.com --client-secret-file /path/to/secret
 
 The secret comes only from a file or the GATEWAY_CLIENT_SECRET variable, never passed via argv.
 Exit 0 — all scenarios passed; otherwise the first FAILED one is printed and exit 1.

@@ -43,13 +43,13 @@ Control plane
 
 ```
 GET /gateway/{module}/{instance}
-Authorization: Bearer <service token of the gateway audience>
+Authorization: Bearer <client_credentials token of the configured audience>
 Upgrade: websocket
 ```
 
 `{module}` and `{instance}` match `^[a-z0-9][a-z0-9_-]{0,62}$` and must equal `module` / `instance` in the `/register` frame that follows.
 
-The token is a `client_credentials` JWT issued by [AuthServer](https://github.com/apostoldevel/module-AuthServer) for the audience named in `module.GatewayAPI.audience`. The gateway verifies the signature, `exp` and `iss` with the provider's secret **and** that `aud` is that provider's `client_id` — a valid token of any other audience is refused. The check runs once, on the handshake; a token expiring while the socket lives does not close it.
+The token is a `client_credentials` JWT issued by [AuthServer](https://github.com/apostoldevel/module-AuthServer) for the audience named in `module.GatewayAPI.audience` — by default `service`, the service client every deployment already has. The gateway verifies the signature, `exp` and `iss` with the provider's secret **and** that `aud` is that provider's `client_id` — a valid token of any other audience is refused. The check runs once, on the handshake; a token expiring while the socket lives does not close it.
 
 A refusal is an HTTP status **before** the `101`, `problem+json` in the body:
 
@@ -318,7 +318,7 @@ Section `module.GatewayAPI` of the application's JSON configuration:
 | `response_timeout_ms` | `30000` | from sending the request to the last byte of the answer |
 | `reload_interval` | `60` | seconds between re-reads of `gateway.node` and sweeps |
 | `allowed_cidr` | `[]` | IPv4 networks `a.b.c.d/n` an instance may register an `address` in; an empty list refuses every registration with `403` |
-| `audience` | `gateway` | the OAuth2 provider (section of `oauth2/*.json`) whose tokens open the control plane |
+| `audience` | `service` | the OAuth2 provider (section of `oauth2/*.json`) whose tokens open the control plane |
 
 Installation
 -
@@ -349,21 +349,7 @@ app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, c
 });
 ```
 
-**OAuth2 audience.** A provider for the control plane in `oauth2/*.json`, `client_credentials` only, next to `web` / `service`:
-
-```json
-"gateway": {
-  "issuers": ["accounts.${DOMAIN}"],
-  "scopes": ["${PROJECT_NAME}", "https://${DOMAIN}"],
-  "client_id": "gateway-${DOMAIN}",
-  "client_secret": "$CLIENT_SECRET_GATEWAY",
-  "algorithm": "HS256",
-  "auth_uri": "/oauth2/authorize",
-  "token_uri": "/oauth2/token"
-}
-```
-
-and the matching audience in the database (`AddApplication` + `CreateAudience` of db-platform). At start the module logs an error if the audience is missing or its secret is empty — every module would be refused with nothing but close reasons to show for it.
+**OAuth2 audience.** The control plane is opened by `client_credentials` tokens of the provider named in `audience` — by default the `service` provider of `oauth2/*.json`, which every Apostol deployment has (client_id `service-${DOMAIN}`, secret from `CLIENT_SECRET_SERVICE`); modules obtain their token from `POST /oauth2/token` with that client. A dedicated provider is possible (`audience` names it; the matching audience must exist in the database — `AddApplication` + `CreateAudience` of db-platform), but not required. At start the module logs an error if the provider is missing or its secret is empty — every module would be refused with nothing but close reasons to show for it.
 
 **Database.** Schema `gateway` from db-platform (module `gateway`, in `create.psql` / `update.psql`, or its patch on an existing database). The worker pool role needs `SELECT, INSERT, UPDATE, DELETE` on `gateway.node` and `INSERT` on `gateway.log` — granted by the module's `table.sql`.
 
@@ -374,7 +360,7 @@ Self-test
 
 ```bash
 python3 tests/stub_client.py --gateway http://127.0.0.1:4977 \
-    --client-id gateway-example.com --client-secret-file /path/to/secret
+    --client-id service-example.com --client-secret-file /path/to/secret
 # mirror scenario: a second gateway process on the same database plays the second worker
 python3 tests/stub_client.py … --peer http://127.0.0.1:4978 \
     --pg "host=127.0.0.1 port=5432 dbname=example user=daemon" --pg-password-file /path/to/pgpass

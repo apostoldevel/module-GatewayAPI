@@ -43,13 +43,13 @@
 
 ```
 GET /gateway/{module}/{instance}
-Authorization: Bearer <сервисный токен аудитории шлюза>
+Authorization: Bearer <токен client_credentials настроенной аудитории>
 Upgrade: websocket
 ```
 
 `{module}` и `{instance}` — по `^[a-z0-9][a-z0-9_-]{0,62}$` и должны совпадать с `module` / `instance` в следующем за рукопожатием кадре `/register`.
 
-Токен — JWT `client_credentials`, выданный [AuthServer](https://github.com/apostoldevel/module-AuthServer) для аудитории, названной в `module.GatewayAPI.audience`. Шлюз проверяет подпись, `exp` и `iss` секретом провайдера **и** что `aud` равен `client_id` этого провайдера — валидный токен любой другой аудитории отвергается. Проверка один раз, на рукопожатии; истечение токена при живом сокете соединение не рвёт.
+Токен — JWT `client_credentials`, выданный [AuthServer](https://github.com/apostoldevel/module-AuthServer) для аудитории, названной в `module.GatewayAPI.audience` — по умолчанию `service`, сервисный клиент, который есть у каждой установки. Шлюз проверяет подпись, `exp` и `iss` секретом провайдера **и** что `aud` равен `client_id` этого провайдера — валидный токен любой другой аудитории отвергается. Проверка один раз, на рукопожатии; истечение токена при живом сокете соединение не рвёт.
 
 Отказ — HTTP-статус **до** `101`, в теле `problem+json`:
 
@@ -318,7 +318,7 @@ module ──► instance ──► { address, prefixes[], state, capacity,
 | `response_timeout_ms` | `30000` | от отправки запроса до последнего байта ответа |
 | `reload_interval` | `60` | секунд между перечитками `gateway.node` и уборками |
 | `allowed_cidr` | `[]` | IPv4-сети `a.b.c.d/n`, в которых экземпляр может зарегистрировать `address`; пустой список отвергает каждую регистрацию с `403` |
-| `audience` | `gateway` | OAuth2-провайдер (секция `oauth2/*.json`), чьи токены открывают плоскость управления |
+| `audience` | `service` | OAuth2-провайдер (секция `oauth2/*.json`), чьи токены открывают плоскость управления |
 
 Установка
 -
@@ -349,21 +349,7 @@ app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, c
 });
 ```
 
-**Аудитория OAuth2.** Провайдер для плоскости управления в `oauth2/*.json`, только `client_credentials`, рядом с `web` / `service`:
-
-```json
-"gateway": {
-  "issuers": ["accounts.${DOMAIN}"],
-  "scopes": ["${PROJECT_NAME}", "https://${DOMAIN}"],
-  "client_id": "gateway-${DOMAIN}",
-  "client_secret": "$CLIENT_SECRET_GATEWAY",
-  "algorithm": "HS256",
-  "auth_uri": "/oauth2/authorize",
-  "token_uri": "/oauth2/token"
-}
-```
-
-и соответствующая аудитория в базе (`AddApplication` + `CreateAudience` db-platform). На старте модуль пишет ошибку в журнал, если аудитории нет или её секрет пуст — иначе каждый модуль отвергался бы, а в журнале были бы одни причины закрытия.
+**Аудитория OAuth2.** Плоскость управления открывают токены `client_credentials` провайдера, названного в `audience` — по умолчанию провайдер `service` из `oauth2/*.json`, который есть у каждой установки Апостола (client_id `service-${DOMAIN}`, секрет из `CLIENT_SECRET_SERVICE`); модули получают токен через `POST /oauth2/token` этим клиентом. Отдельный провайдер возможен (его называет `audience`; соответствующая аудитория должна быть в базе — `AddApplication` + `CreateAudience` db-platform), но не обязателен. На старте модуль пишет ошибку в журнал, если провайдера нет или его секрет пуст — иначе каждый модуль отвергался бы, а в журнале были бы одни причины закрытия.
 
 **База данных.** Схема `gateway` из db-platform (модуль `gateway` в `create.psql` / `update.psql` или его патч на существующей базе). Роли worker-пула нужны `SELECT, INSERT, UPDATE, DELETE` на `gateway.node` и `INSERT` на `gateway.log` — выдаются в `table.sql` модуля.
 
@@ -374,7 +360,7 @@ app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, c
 
 ```bash
 python3 tests/stub_client.py --gateway http://127.0.0.1:4977 \
-    --client-id gateway-example.com --client-secret-file /path/to/secret
+    --client-id service-example.com --client-secret-file /path/to/secret
 # сценарий зеркала: второй процесс шлюза на той же базе играет второй воркер
 python3 tests/stub_client.py … --peer http://127.0.0.1:4978 \
     --pg "host=127.0.0.1 port=5432 dbname=example user=daemon" --pg-password-file /path/to/pgpass

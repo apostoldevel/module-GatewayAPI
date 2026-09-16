@@ -321,7 +321,7 @@ private:
     int         heartbeat_interval_{5};
     int         suspect_after_{2};
     int         offline_after_{4};
-    std::string audience_{"gateway"};
+    std::string audience_{"service"};
     int         connect_timeout_ms_{1000};
     int         response_timeout_ms_{30000};
     int         reload_interval_{60};
