@@ -182,14 +182,24 @@ private:
                         std::string_view request_id, bool retry_after = false) const;
 
     /// Verify the Bearer against the gateway audience. Returns "" when ok,
-    /// otherwise a short reason ("unauthorized" / "forbidden").
+    /// otherwise a short reason: "no-credentials" (no Bearer at all),
+    /// "unauthorized" (not a valid token of this audience), "forbidden" (expired).
     std::string check_gateway_token(const HttpRequest& req) const;
     /// problem+json (RFC 9457) the gateway's way: type urn:apostol:gateway:<slug>,
-    /// code null, X-Request-Id — minted here unless @p request_id is given
-    /// (the data plane has one already: the one the module saw).
+    /// X-Request-Id — minted here unless @p request_id is given (the data plane
+    /// has one already: the one the module saw). Every 401 also gets the
+    /// challenge and a catalogue code (see the body); @p no_credentials marks a
+    /// request that carried no Bearer at all.
     void reply_problem(HttpResponse& resp, int status, std::string_view slug,
                        std::string_view title, std::string_view detail,
-                       std::string_view instance_path, std::string_view request_id = {}) const;
+                       std::string_view instance_path, std::string_view request_id = {},
+                       bool no_credentials = false) const;
+
+    /// WWW-Authenticate for a 401 the gateway produces itself (RFC 6750 §3):
+    /// a bare `Bearer` when the request carried no credentials (§3.1),
+    /// otherwise Bearer error="invalid_token", with error_description only when
+    /// @p detail is within the §3 alphabet — the go-platform host's rule.
+    static void set_challenge(HttpResponse& resp, std::string_view detail, bool no_credentials);
 
     // ── WebSocket ──────────────────────────────────────────────────────────
 
