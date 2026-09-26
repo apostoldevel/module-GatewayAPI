@@ -58,7 +58,7 @@ A refusal is an HTTP status **before** the `101`, `problem+json` in the body:
 | `404` | `not-found` | not `{control_path}/{module}/{instance}` |
 | `400` | `bad-request` | a segment does not match the pattern |
 | `401` | `token-invalid` | no token, bad signature, wrong `aud` / `iss` |
-| `403` | `token-expired` | token expired |
+| `401` | `token-expired` | this audience's token expired (403 before T307); an expired token of another audience is `token-invalid` |
 
 (On a framework without the pre-upgrade filter the same refusal arrives as `close 1008` with the reason in the close payload — a module treats both alike.)
 
@@ -227,7 +227,7 @@ Everything the gateway answers on its own is `application/problem+json` (RFC 945
 | `400` | `bad-request` | refused before routing (`result_object` / `result_format` values, payload transformer) | |
 | `401` | `token-invalid` — `code` `ERR-401-001` | no token (control plane), signature, `aud`, `iss`, not a token | `WWW-Authenticate: Bearer error="invalid_token"` |
 | `401` | `token-expired` — `code` `ERR-401-008` | access token expired and no refresh possible (RFC 6750 §3.1) | `WWW-Authenticate: Bearer error="invalid_token"` |
-| `403` | `token-expired` | expired **service** token of the gateway on the control-plane handshake | |
+| `401` | `token-expired` — `code` `ERR-401-008` | expired token of the gateway audience on the control plane (was 403 before T307); an expired token of **another** audience is answered as `token-invalid`, like a valid one of another audience | `WWW-Authenticate: Bearer error="invalid_token"` |
 | `404` | `no-route` | no prefix covers the path | |
 | `405` | `method-not-allowed` | `PUT` / `PATCH` / `DELETE` on the control path | `Allow: GET, POST` |
 | `409` | `not-on-this-worker` | a command for an instance whose socket another worker holds | |
@@ -341,7 +341,7 @@ if (app.module_enabled("AppServer") && app.has_db_pool())
 // …
 app.set_ws_upgrade_filter([gateway_raw](const HttpRequest& req, HttpResponse& resp) {
     if (gateway_raw && gateway_raw->owns_ws_upgrade(req))
-        return gateway_raw->ws_upgrade_allowed(req, resp);   // 404/400/401/403 before the 101
+        return gateway_raw->ws_upgrade_allowed(req, resp);   // 404/400/401 before the 101
     return true;
 });
 app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, const HttpRequest& req) {

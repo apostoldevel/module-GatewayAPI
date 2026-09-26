@@ -3,6 +3,7 @@
 #include "GatewayAPI.hpp"
 
 #include "apostol/application.hpp"
+#include "apostol/base64.hpp"
 #include "apostol/event_loop.hpp"
 #include "apostol/http.hpp"
 #include "apostol/http_utils.hpp"
@@ -256,6 +257,31 @@ std::string GatewayAPI::new_uuid()
 
 // ─── token ───────────────────────────────────────────────────────────────────
 
+// The aud claim of a token whose signature verify_jwt has already checked —
+// read from the payload, which verify_jwt does not hand back on expiry.
+static std::string token_audience(std::string_view token)
+{
+    const auto first = token.find('.');
+    const auto second = first == std::string_view::npos ? first : token.find('.', first + 1);
+    if (second == std::string_view::npos)
+        return {};
+
+    std::string b64(token.substr(first + 1, second - first - 1));
+    std::replace(b64.begin(), b64.end(), '-', '+');
+    std::replace(b64.begin(), b64.end(), '_', '/');
+    while (b64.size() % 4)
+        b64 += '=';
+
+    try {
+        const auto payload = json::parse(base64_decode(b64));
+        const auto it = payload.find("aud");
+        if (it != payload.end() && it->is_string())
+            return it->get<std::string>();
+    } catch (const std::exception&) {
+    }
+    return {};
+}
+
 std::string GatewayAPI::check_gateway_token(const HttpRequest& req) const
 {
     // Nothing to check is its own answer: RFC 6750 §3.1 wants a bare challenge
@@ -273,7 +299,16 @@ std::string GatewayAPI::check_gateway_token(const HttpRequest& req) const
             return "unauthorized";
         return {};
     } catch (const JwtExpiredError&) {
-        return "forbidden";
+        // Expired — but whose? verify_jwt checks the signature before the
+        // expiry (measured: an expired token with a wrong signature is
+        // "invalid"), so the aud read here is authentic. A token of another
+        // audience gets the answer a valid one of another audience gets:
+        // saying "expired" to it tells the caller it holds a genuinely signed
+        // token, which the control plane has no business confirming.
+        const auto* app = providers_.find_default(audience_);
+        if (!app || token_audience(auth.token) != app->client_id)
+            return "unauthorized";
+        return "expired";
     } catch (const std::exception&) {
         // JwtVerificationError — and anything else verify_jwt lets out on a
         // string that is not a token at all (base64 "too much fill" from a
@@ -337,10 +372,15 @@ void GatewayAPI::do_get(const HttpRequest& req, HttpResponse& resp)
         return;
     }
     if (auto why = check_gateway_token(req); !why.empty()) {
-        reply_problem(resp, why == "forbidden" ? 403 : 401,
-                      why == "forbidden" ? "token-expired" : "token-invalid",
-                      why == "forbidden" ? "Forbidden" : "Unauthorized",
-                      "gateway audience token required", req.path, {},
+        // 401 for an expired token too (RFC 6750 §3.1: invalid_token covers
+        // "expired"); it was 403. The gateway client answers every 4xx of the
+        // handshake the same way — a slow retry with a fresh token.
+        reply_problem(resp, 401,
+                      why == "expired" ? "token-expired" : "token-invalid",
+                      "Unauthorized",
+                      why == "expired" ? "gateway audience token expired"
+                                       : "gateway audience token required",
+                      req.path, {},
                       /*no_credentials=*/why == "no-credentials");
         return;
     }
@@ -397,10 +437,15 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
         return;
     }
     if (auto why = check_gateway_token(req); !why.empty()) {
-        reply_problem(resp, why == "forbidden" ? 403 : 401,
-                      why == "forbidden" ? "token-expired" : "token-invalid",
-                      why == "forbidden" ? "Forbidden" : "Unauthorized",
-                      "gateway audience token required", req.path, {},
+        // 401 for an expired token too (RFC 6750 §3.1: invalid_token covers
+        // "expired"); it was 403. The gateway client answers every 4xx of the
+        // handshake the same way — a slow retry with a fresh token.
+        reply_problem(resp, 401,
+                      why == "expired" ? "token-expired" : "token-invalid",
+                      "Unauthorized",
+                      why == "expired" ? "gateway audience token expired"
+                                       : "gateway audience token required",
+                      req.path, {},
                       /*no_credentials=*/why == "no-credentials");
         return;
     }
@@ -445,7 +490,7 @@ std::string GatewayAPI::handshake_refusal(const HttpRequest& req, std::string& m
         return "not-found";
     if (!valid_name(module) || !valid_name(instance))
         return "bad-request";
-    return check_gateway_token(req);   // "" | "no-credentials" | "unauthorized" | "forbidden"
+    return check_gateway_token(req);   // "" | "no-credentials" | "unauthorized" | "expired"
 }
 
 bool GatewayAPI::ws_upgrade_allowed(const HttpRequest& req, HttpResponse& resp) const
@@ -460,8 +505,8 @@ bool GatewayAPI::ws_upgrade_allowed(const HttpRequest& req, HttpResponse& resp) 
         reply_problem(resp, 404, "not-found", "Not Found", "unknown control path", req.path);
     else if (refuse == "bad-request")
         reply_problem(resp, 400, "bad-request", "Bad Request", "module and instance: ^[a-z0-9][a-z0-9_-]{0,62}$", req.path);
-    else if (refuse == "forbidden")
-        reply_problem(resp, 403, "token-expired", "Forbidden", "gateway audience token expired", req.path);
+    else if (refuse == "expired")
+        reply_problem(resp, 401, "token-expired", "Unauthorized", "gateway audience token expired", req.path);
     else
         reply_problem(resp, 401, "token-invalid", "Unauthorized", "gateway audience token required", req.path, {},
                       /*no_credentials=*/refuse == "no-credentials");

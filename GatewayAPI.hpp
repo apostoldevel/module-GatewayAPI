@@ -72,13 +72,14 @@ public:
     bool owns_ws_upgrade(const HttpRequest& req) const;
 
     /// The pre-upgrade filter (Application::set_ws_upgrade_filter): the HTTP
-    /// refusal — 404 unknown control path, 401 token-invalid, 403
-    /// token-expired as problem+json — BEFORE the 101. Returns true to let the
+    /// refusal — 404 unknown control path, 401 token-invalid or token-expired
+    /// as problem+json — BEFORE the 101. Returns true to let the
     /// upgrade through. Called from the filter lambda the application installs
     /// (README § Installation).
     bool ws_upgrade_allowed(const HttpRequest& req, HttpResponse& resp) const;
     /// The one predicate behind both: "" when the handshake may proceed, else
-    /// not-found | bad-request | unauthorized | forbidden (README § Handshake).
+    /// not-found | bad-request | no-credentials | unauthorized | expired
+    /// (README § Handshake).
     std::string handshake_refusal(const HttpRequest& req, std::string& module, std::string& instance) const;
 
     /// Called from the application's ws_handler lambda, after the 101. The
@@ -125,8 +126,9 @@ protected:
 
     /// Every refusal AppServer produces itself — check_auth synchronously, the
     /// refresh callback asynchronously — as the gateway's problem+json (README
-    /// § Errors): invalid → 401 token-invalid, expired / refresh_failed /
-    /// database-401 → 401 token-expired, the rest by status.
+    /// § Errors): invalid → 401 token-invalid, expired / database-401 → 401
+    /// token-expired, the rest by status (refresh_failed is no longer produced
+    /// by AppServer — T307 — and still maps to token-expired for overrides).
     void reply_refused(HttpResponse& resp, const Refusal& refusal) override;
 
 private:
@@ -183,7 +185,8 @@ private:
 
     /// Verify the Bearer against the gateway audience. Returns "" when ok,
     /// otherwise a short reason: "no-credentials" (no Bearer at all),
-    /// "unauthorized" (not a valid token of this audience), "forbidden" (expired).
+    /// "unauthorized" (not a valid token of this audience — an expired token of
+    /// another audience included), "expired" (this audience's, expired).
     std::string check_gateway_token(const HttpRequest& req) const;
     /// problem+json (RFC 9457) the gateway's way: type urn:apostol:gateway:<slug>,
     /// X-Request-Id — minted here unless @p request_id is given (the data plane

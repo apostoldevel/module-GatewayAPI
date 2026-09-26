@@ -58,7 +58,7 @@ Upgrade: websocket
 | `404` | `not-found` | путь не `{control_path}/{module}/{instance}` |
 | `400` | `bad-request` | сегмент не по шаблону |
 | `401` | `token-invalid` | нет токена, плохая подпись, не тот `aud` / `iss` |
-| `403` | `token-expired` | токен просрочен |
+| `401` | `token-expired` | истёк токен аудитории шлюза (до T307 — 403); истёкший токен чужой аудитории — `token-invalid` |
 
 (На фреймворке без фильтра до апгрейда тот же отказ приходит как `close 1008` с причиной в close-кадре — модуль переживает оба одинаково.)
 
@@ -227,7 +227,7 @@ module ──► instance ──► { address, prefixes[], state, capacity,
 | `400` | `bad-request` | отказ до маршрутизации (значения `result_object` / `result_format`, преобразователь тела) | |
 | `401` | `token-invalid` — `code` `ERR-401-001` | нет токена (плоскость управления), подпись, `aud`, `iss`, не токен | `WWW-Authenticate: Bearer error="invalid_token"` |
 | `401` | `token-expired` — `code` `ERR-401-008` | токен доступа просрочен, обновление невозможно (RFC 6750 §3.1) | `WWW-Authenticate: Bearer error="invalid_token"` |
-| `403` | `token-expired` | просроченный **сервисный** токен шлюза на рукопожатии плоскости управления | |
+| `401` | `token-expired` — `code` `ERR-401-008` | просроченный токен аудитории шлюза на плоскости управления (до T307 — 403); просроченный токен **чужой** аудитории получает `token-invalid`, как годный чужой | `WWW-Authenticate: Bearer error="invalid_token"` |
 | `404` | `no-route` | ни один префикс не покрывает путь | |
 | `405` | `method-not-allowed` | `PUT` / `PATCH` / `DELETE` на управляющий путь | `Allow: GET, POST` |
 | `409` | `not-on-this-worker` | команда экземпляру, сокет которого держит другой воркер | |
@@ -341,7 +341,7 @@ if (app.module_enabled("AppServer") && app.has_db_pool())
 // …
 app.set_ws_upgrade_filter([gateway_raw](const HttpRequest& req, HttpResponse& resp) {
     if (gateway_raw && gateway_raw->owns_ws_upgrade(req))
-        return gateway_raw->ws_upgrade_allowed(req, resp);   // 404/400/401/403 до 101
+        return gateway_raw->ws_upgrade_allowed(req, resp);   // 404/400/401 до 101
     return true;
 });
 app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, const HttpRequest& req) {
