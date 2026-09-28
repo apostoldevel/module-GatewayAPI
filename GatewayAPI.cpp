@@ -1481,6 +1481,7 @@ void GatewayAPI::mirror_warn(std::string_view what, std::string_view error)
 
 void GatewayAPI::mirror_exec(std::string sql, std::string what, PgQuery::ResultHandler on_result, std::string kind)
 {
+    ++mirror_seq_;
     if (!kind.empty())
         std::erase_if(mirror_queue_, [&](const MirrorWrite& w) { return w.kind == kind; });
     mirror_queue_.push_back({std::move(sql), std::move(what), std::move(on_result), std::move(kind)});
@@ -1541,6 +1542,7 @@ void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason
     // (no explicit BEGIN), so the transaction-local GUC reaches the trigger
     // and both NOTIFYs leave on the same commit, in this order.
     mirror_exec(std::move(sql), fmt::format("upsert {}/{}", inst.module, inst.instance));
+    inst.written = inst.upserted = mirror_seq_;
 }
 
 void GatewayAPI::mirror_state(const Instance& inst, std::string_view reason)
@@ -1550,6 +1552,7 @@ void GatewayAPI::mirror_state(const Instance& inst, std::string_view reason)
         "UPDATE gateway.node SET state = {}, updated = now() WHERE {} AND worker = {};",
         pq_quote_literal(reason), pq_quote_literal(inst.state), sql_ident(inst.module, inst.instance), pid_),
         fmt::format("state {}/{} -> {}", inst.module, inst.instance, inst.state));
+    inst.written = mirror_seq_;
     // `AND worker = pid`: the FIFO orders this worker's writes against each
     // other, not against another worker's. A transition queued here before
     // the NOTIFY of a takeover arrives, landing after the taker's upsert,
@@ -1601,7 +1604,16 @@ void GatewayAPI::mirror_reload()
         "    FROM gateway.node WHERE state <> 'offline') n;",
         pq_quote_literal(fmt::format("swept by worker {}: seen older than {} s", pid_, stale_s)), pid_, stale_s);
 
-    mirror_exec(std::move(sql), "sweep+reload", [this](std::vector<PgResult> results) {
+    // The writes of this worker run in one queue, in order: one queued after
+    // this reload lands after its snapshot. An own row the snapshot shows
+    // differently from memory is then the row BEFORE that write, not a row
+    // someone else got wrong — re-asserting it would only move `seen`
+    // without a heartbeat (the stub caught it: ready -> suspect queued right
+    // behind the reload). The write in the queue settles what it writes: an
+    // upsert the whole row, a state write the state. A takeover does not wait
+    // on it — a state write matches no row another worker holds.
+    const std::uint64_t snapshot = mirror_seq_ + 1;   // the seq mirror_exec gives this reload
+    mirror_exec(std::move(sql), "sweep+reload", [this, snapshot](std::vector<PgResult> results) {
         if (results.empty() || results.back().rows() != 1) { mirror_warn("reload", "no result row"); return; }
         json rows;
         try { rows = json::parse(results.back().value(0, 0)); }
@@ -1632,14 +1644,20 @@ void GatewayAPI::mirror_reload()
                         take_over(module, instance, worker);
                         mirror_apply(row, "reload");
                     }
-                } else if (row.value("state", "") != mine->state || row.value("address", "") != mine->address ||
-                           row.value("prefixes", json::array()) != json(mine->prefixes)) {
-                    // Someone (the sweep, a database that was away, a hand
-                    // with UPDATE on the table) has the row wrong: the socket
-                    // is the truth, re-assert it. An address changed under our
-                    // pid is silent — no state change, no NOTIFY — and the
-                    // other workers would refuse or misroute it for good.
-                    mirror_upsert(*mine, {}, "owner re-asserted", true);
+                } else {
+                    const bool same_route = row.value("address", "") == mine->address &&
+                                            row.value("prefixes", json::array()) == json(mine->prefixes);
+                    // A write of ours behind the snapshot settles the row: an
+                    // upsert any of it, a state write the state alone.
+                    const bool queued = mine->upserted > snapshot || (same_route && mine->written > snapshot);
+                    if (!queued && (!same_route || row.value("state", "") != mine->state)) {
+                        // Someone (the sweep, a database that was away, a hand
+                        // with UPDATE on the table) has the row wrong: the
+                        // socket is the truth, re-assert it. An address changed
+                        // under our pid is silent — no state change, no NOTIFY —
+                        // and the other workers would refuse or misroute it.
+                        mirror_upsert(*mine, {}, "owner re-asserted", true);
+                    }
                 }
                 continue;
             }
@@ -1665,8 +1683,10 @@ void GatewayAPI::mirror_reload()
                 if (owns(inst) && socket_of(mod, name)) {
                     // Missing or offline in the database while the socket is
                     // alive — the database was away when we wrote, or the sweep
-                    // beat a `seen` that never arrived. Ours: re-assert.
-                    mirror_upsert(inst, {}, "owner re-asserted", true);
+                    // beat a `seen` that never arrived. Ours: re-assert, unless
+                    // an upsert of ours is still behind the snapshot (a state
+                    // write matches no row that is not there).
+                    if (inst.upserted <= snapshot) mirror_upsert(inst, {}, "owner re-asserted", true);
                 } else if (inst.source == Source::mirror) {
                     log_.notice("GatewayAPI: {}/{} {} -> offline (mirror: not in gateway.node)", mod, name, inst.state);
                     inst.state = "offline";

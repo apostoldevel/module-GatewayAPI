@@ -112,6 +112,11 @@ public:
         std::chrono::system_clock::time_point last_heartbeat;
         int         owner_worker{0};
         Source      source{Source::socket};
+        // mirror_seq_ of this worker's last write of the row — any (upsert or
+        // state) and the last upsert: a reload snapshot older than it predates
+        // a write still in the queue. Only an upsert rewrites the whole row.
+        mutable std::uint64_t written{0};
+        mutable std::uint64_t upserted{0};
     };
 
 protected:
@@ -375,6 +380,7 @@ private:
     struct MirrorWrite { std::string sql; std::string what; PgQuery::ResultHandler on_result; std::string kind; };
     std::deque<MirrorWrite> mirror_queue_;
     bool mirror_busy_{false};
+    std::uint64_t mirror_seq_{0};   // mirror_exec calls so far — orders a snapshot against own writes
     std::chrono::system_clock::time_point mirror_sent_{};   // when the outstanding write was sent
 };
 
