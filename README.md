@@ -257,6 +257,8 @@ The database half of the module is the **`gateway`** module of [db-platform](htt
 
 **Who is right:** a notification about its own row does not move a worker — the `worker` field of the payload is the row's column, not the writer's, and the offline step of another worker's `/register` still carries the previous pid. Only a `ready` with **another** pid acts on an owned row: the earlier socket is closed `1001 replaced`, the row becomes a mirror. With the database away the gateway routes from memory — its own sockets are the truth, foreign instances are the last known copy — and says so once per `reload_interval`.
 
+**What is trusted:** a row that did not come through `/register` — a NOTIFY payload or a row read back — gets the same checks before it touches the table: `address` an IPv4 literal inside `allowed_cidr`, `prefixes` a non-empty array of valid, non-overlapping prefixes. `pg_notify` is open to any role with `CONNECT`; without the checks a forged payload would point `/api/v2/*`, users' Bearer tokens included, at an address of its choosing. A refused row changes nothing — no new mirror, no re-pointed address, no takeover of a live socket — and is logged `mirror row refused (notify|reload): <why>`; a mirror whose row turns unacceptable on a re-read goes `offline`.
+
 Management endpoints
 -
 

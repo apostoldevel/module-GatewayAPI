@@ -1627,11 +1627,18 @@ void GatewayAPI::mirror_reload()
                     continue;
                 if (worker != pid_) {
                     // A NOTIFY we missed: another worker holds the instance now.
-                    take_over(module, instance, worker);
-                    mirror_apply(row, "reload");
-                } else if (row.value("state", "") != mine->state) {
-                    // Someone (the sweep, a database that was away) has the
-                    // row wrong: the socket is the truth, re-assert it.
+                    // A row we would refuse is not a takeover — the socket stays.
+                    if (mirror_admissible(row, "reload")) {
+                        take_over(module, instance, worker);
+                        mirror_apply(row, "reload");
+                    }
+                } else if (row.value("state", "") != mine->state || row.value("address", "") != mine->address ||
+                           row.value("prefixes", json::array()) != json(mine->prefixes)) {
+                    // Someone (the sweep, a database that was away, a hand
+                    // with UPDATE on the table) has the row wrong: the socket
+                    // is the truth, re-assert it. An address changed under our
+                    // pid is silent — no state change, no NOTIFY — and the
+                    // other workers would refuse or misroute it for good.
                     mirror_upsert(*mine, {}, "owner re-asserted", true);
                 }
                 continue;
@@ -1646,7 +1653,9 @@ void GatewayAPI::mirror_reload()
                 if (mine) { mine->state = "offline"; mine->last_heartbeat = now; }
                 continue;
             }
-            mirror_apply(row, "reload");
+            // A row the database holds but this worker refuses to route to
+            // counts as absent: a mirror of it goes offline below.
+            if (!mirror_apply(row, "reload")) seen[module].erase(instance);
         }
 
         for (auto& [mod, insts] : table_)
@@ -1667,7 +1676,74 @@ void GatewayAPI::mirror_reload()
     }, "reload");
 }
 
-void GatewayAPI::mirror_apply(const json& row, std::string_view why)
+std::string GatewayAPI::mirror_refusal(const json& row) const
+{
+    // A row that did not come through /register has had none of its checks:
+    // pg_notify is open to any role with CONNECT, and a forged payload would
+    // otherwise point /api/v2/* — Bearer tokens of users included — at an
+    // address of its choosing, or under a prefix of another module (the
+    // longest prefix wins). The /register rules, 400/403/409 there.
+    const std::string module   = row.value("module", "");
+    const std::string instance = row.value("instance", "");
+    if (!valid_name(module) || !valid_name(instance)) return "bad module or instance name";
+
+    if (!row.contains("address") || !row["address"].is_string()) return "no address";
+    std::string host; uint16_t port = 0;
+    const auto address = row["address"].get<std::string>();
+    if (!parse_address(address, host, port)) return "address is not ipv4:port";
+    if (!address_allowed(host)) return fmt::format("address {} is outside allowed_cidr", host);
+
+    if (!row.contains("prefixes") || !row["prefixes"].is_array() || row["prefixes"].empty())
+        return "prefixes must be a non-empty array";
+    std::vector<std::string> prefixes;
+    for (const auto& item : row["prefixes"]) {
+        if (!item.is_string()) return "prefix must be a string";
+        const auto s = item.get<std::string>();
+        if (!valid_prefix(s)) return "bad prefix";
+        for (const auto& have : prefixes)
+            if (prefixes_overlap(have, s)) return fmt::format("prefixes overlap: {} and {}", have, s);
+        prefixes.push_back(s);
+    }
+    for (const auto& [mod, insts] : table_) {
+        if (mod == module) continue;
+        for (const auto& [name, inst] : insts) {
+            if (inst.state == "offline") continue;
+            for (const auto& theirs : inst.prefixes)
+                for (const auto& mine : prefixes)
+                    if (prefixes_overlap(theirs, mine))
+                        return fmt::format("prefix {} belongs to module {}", mine, mod);
+        }
+    }
+    return {};
+}
+
+bool GatewayAPI::mirror_admissible(const json& row, std::string_view why)
+{
+    const auto reason = mirror_refusal(row);
+    if (reason.empty()) return true;
+    mirror_refused(row, why, reason);
+    return false;
+}
+
+void GatewayAPI::mirror_refused(const json& row, std::string_view why, std::string_view reason)
+{
+    // Throttled: a loop of forged pg_notify, or a bad row every reload on every
+    // worker, must not become the same number of log lines. Names only when
+    // valid — a forged one would otherwise write lines of its own into the log;
+    // the reason carries no raw input for the same cause.
+    const auto now = clock_t_::now();
+    if (now < refused_warned_) { ++refused_quiet_; return; }
+    refused_warned_ = now + std::chrono::seconds(reload_interval_);
+    const std::string module   = row.value("module", "");
+    const std::string instance = row.value("instance", "");
+    const bool named = valid_name(module) && valid_name(instance);
+    log_.warn("GatewayAPI: {}/{}: mirror row refused ({}): {}{}", named ? module : "?", named ? instance : "?",
+              why, reason, refused_quiet_ ? fmt::format(" (+{} refused in the last {} s, not logged)",
+                                                        refused_quiet_, reload_interval_) : std::string{});
+    refused_quiet_ = 0;
+}
+
+bool GatewayAPI::mirror_apply(const json& row, std::string_view why)
 {
     // A row of ANOTHER worker: whatever the database says is what this worker
     // routes by. Fields not in the NOTIFY payload (version, capacity) arrive
@@ -1675,11 +1751,23 @@ void GatewayAPI::mirror_apply(const json& row, std::string_view why)
     const std::string module   = row.value("module", "");
     const std::string instance = row.value("instance", "");
     const std::string state    = row.value("state", "");
-    if (module.empty() || instance.empty() || state.empty()) return;
+    if (module.empty() || instance.empty() || state.empty()) return true;
 
     const auto now = clock_t_::now();
     auto* known = find_instance(module, instance);
-    if (!known && state == "offline") return;   // nothing to route to, nothing to forget
+    if (!known && state == "offline") return true;   // nothing to route to, nothing to forget
+    if (const auto reason = mirror_refusal(row); !reason.empty()) {
+        if (!known || state == "ready") { mirror_refused(row, why, reason); return false; }
+        // Out of rotation only (offline, draining, suspect): the row routes
+        // nothing, and refusing it would keep routing to the last good address
+        // until the next reload. The state moves; address and prefixes stay.
+        if (known->state != state) {
+            log_.notice("GatewayAPI: {}/{} {} -> {} (mirror: {}, state only: {})", module, instance, known->state,
+                        state, why, reason);
+            known->state = state;
+        }
+        return true;
+    }
     Instance& inst = known ? *known : table_[module][instance];
     const bool fresh = !known;
     const std::string from = fresh ? "(none)" : inst.state;
@@ -1687,15 +1775,9 @@ void GatewayAPI::mirror_apply(const json& row, std::string_view why)
     inst.instance = instance;
     if (row.contains("version") && row["version"].is_string())    inst.version  = row["version"].get<std::string>();
     if (row.contains("capacity") && row["capacity"].is_number())  inst.capacity = row["capacity"].get<int>();
-    if (row.contains("address") && row["address"].is_string()) {
-        inst.address = row["address"].get<std::string>();
-        std::string host; uint16_t port = 0;
-        if (parse_address(inst.address, host, port)) { inst.host = host; inst.port = port; }
-    }
-    if (row.contains("prefixes") && row["prefixes"].is_array()) {
-        inst.prefixes.clear();
-        for (const auto& p : row["prefixes"]) if (p.is_string()) inst.prefixes.push_back(p.get<std::string>());
-    }
+    inst.address = row["address"].get<std::string>();   // both checked by mirror_refusal
+    parse_address(inst.address, inst.host, inst.port);
+    inst.prefixes = row["prefixes"].get<std::vector<std::string>>();
     inst.owner_worker = int_or(row, "worker", 0);
     inst.source       = Source::mirror;
     inst.conn_errors  = 0;   // the owner hears it; our passive count starts over
@@ -1708,6 +1790,7 @@ void GatewayAPI::mirror_apply(const json& row, std::string_view why)
         log_.notice("GatewayAPI: {}/{} {} -> {} (mirror: {}, worker {})", module, instance, from, state, why, inst.owner_worker);
         inst.state = state;
     }
+    return true;
 }
 
 void GatewayAPI::take_over(const std::string& module, const std::string& instance, int by_worker)
@@ -1760,7 +1843,8 @@ void GatewayAPI::on_gateway_notify_(std::string_view payload)
         // on the offline would fight the register of a worker taking the
         // instance over (its offline step keeps our pid) — the ready that
         // follows, with ITS pid, is the takeover.
-        if (worker != pid_ && msg.value("state", "") != "offline") {
+        const std::string state = msg.value("state", "");
+        if (worker != pid_ && !state.empty() && state != "offline" && mirror_admissible(msg, "notify")) {
             take_over(module, instance, worker);
             mirror_apply(msg, "notify");
         }

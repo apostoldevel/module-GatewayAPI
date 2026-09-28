@@ -760,7 +760,80 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         j = journal("mirror", "ghost", l6)
         check(j and j[-1] == ("ready", "offline", "no socket on worker"), f"gateway.log: reason=no socket on worker ({j})")
 
-        # 9. Startup reload is covered indirectly: the peer started earlier and learned mirror/*
+        # 9. Rows that did not come through /register get its checks (address inside allowed_cidr,
+        #    valid prefixes): pg_notify is open to any role with CONNECT. A refused row changes
+        #    nothing — no new mirror, no re-pointed address, no takeover of a live socket.
+        def notify(**p):
+            q("SELECT pg_notify('gateway', %s)", json.dumps(dict({"op": "UPDATE", "module": "mirror", "state": "ready", "state_from": "offline"}, **p)))
+
+        notify(instance="forged", address="10.9.9.9:80", prefixes=["/api/v2/forged"], worker=424243)
+        notify(instance="forged-p", address="127.0.0.1:18196", prefixes=["/api/v1/forged"], worker=424243)
+        await asyncio.sleep(0.5)
+        for side, name in ((gw, "mine"), (peer, "peer")):
+            t = listing(side, tok)
+            check(("mirror", "forged") not in t and ("mirror", "forged-p") not in t,
+                  f"{name}: forged NOTIFY — address outside allowed_cidr, bad prefix — refused, no mirror")
+        r = requests.get(f"{gw}/gateway/route", params={"path": "/api/v2/forged/x"}, headers=hdrs, timeout=5)
+        check(r.status_code == 404, f"no route to the forged prefix ({r.status_code})")
+
+        # the peer has m3 as a mirror, I hold its socket: a forged ready with a foreign pid and
+        # a foreign address must neither re-point the peer nor take the instance over from me
+        notify(instance="m3", address="10.9.9.9:80", prefixes=["/api/v2/mirror3"], worker=424243)
+        await asyncio.sleep(0.5)
+        check(listing(peer, tok)[("mirror", "m3")]["address"] == "127.0.0.1:18110", "peer: forged NOTIFY did not re-point m3")
+        mine = listing(gw, tok)[("mirror", "m3")]
+        check(mine["source"] == "socket" and mine["address"] == "127.0.0.1:18110", "mine: forged ready with a foreign pid is no takeover — socket kept")
+        await ws3.send(call("/heartbeat", {"in_flight": 0}))
+        check((await rx(ws3))["t"] == 3, "m3 socket alive after the forged NOTIFY")
+
+        # a prefix under another module's live prefix, from an address that IS allowed: the longest
+        # prefix would win, so this is a hijack of /api/v2/mirror3/x/* — refused like a 409 at /register
+        notify(module="evil", instance="e1", address="127.0.0.1:18194", prefixes=["/api/v2/mirror3/x"], worker=424243)
+        notify(instance="bad\nname", address="127.0.0.1:18193", prefixes=["/api/v2/mirror-nl"], worker=424243)
+        await asyncio.sleep(0.5)
+        t = listing(gw, tok)
+        check(("evil", "e1") not in t, "forged prefix under another module's live prefix — refused")
+        check(not any("\n" in i for _, i in t), "forged name with a newline — refused")
+        r = requests.get(f"{gw}/gateway/route", params={"path": "/api/v2/mirror3/x/1"}, headers=hdrs, timeout=5)
+        check(r.status_code == 200 and r.json()["module"] == "mirror", f"/api/v2/mirror3/x/1 still routes to mirror/m3 ({r.status_code})")
+
+        # my own row's address changed silently under my pid (no state change — no NOTIFY): the
+        # peer would refuse it for good; the owner's reload re-asserts what its socket says
+        q("UPDATE gateway.node SET address = '10.9.9.9:80' WHERE module = 'mirror' AND instance = 'm3'")
+        check(await settle(lambda: row("mirror", "m3")[2] == "127.0.0.1:18110", RELOAD + 2, "m3 address", hb=ws3),
+              "reload: my row's address changed under my pid → re-asserted from the socket")
+
+        # reload: a row the database holds with an address outside allowed_cidr is not routed to;
+        # a mirror whose row turns bad goes offline. The UPDATE of address alone is silent (no
+        # state change — no NOTIFY), so only the reload can see it.
+        q("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
+          " VALUES ('mirror', 'bad', '0', '10.9.9.9:80', ARRAY['/api/v2/mirror-bad'], 'ready', 1, NULL)"
+          " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', address = EXCLUDED.address, worker = NULL, seen = now()")
+        q("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
+          " VALUES ('mirror', 'turns', '0', '127.0.0.1:18195', ARRAY['/api/v2/mirror-turns'], 'ready', 1, NULL)"
+          " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', address = EXCLUDED.address, worker = NULL, seen = now()")
+        check(await settle(lambda: listing(gw, tok).get(("mirror", "turns"), {}).get("state") == "ready", 3, "turns"), "valid foreign row mirrored")
+        q("UPDATE gateway.node SET address = '10.9.9.9:80', seen = now() WHERE module = 'mirror' AND instance = 'turns'")
+        check(await settle(lambda: listing(gw, tok)[("mirror", "turns")]["state"] == "offline", RELOAD + 2, "turns off", hb=ws3),
+              "reload: the mirror whose row turned bad → offline")
+        check(row("mirror", "turns")[0] == "ready", "…by the refusal, not by the sweep: the database row is still ready")
+        t = listing(gw, tok)
+        check(("mirror", "bad") not in t and t[("mirror", "turns")]["address"] == "127.0.0.1:18195",
+              "reload: bad row never mirrored, the refused one kept its last good address")
+        q("UPDATE gateway.node SET state = 'offline' WHERE module = 'mirror' AND instance IN ('bad', 'turns')")
+
+        # leaving rotation is taken even from a row that fails the checks: refusing a legitimate
+        # offline would keep routing to the last good address until the next reload
+        q("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
+          " VALUES ('mirror', 'leave', '0', '127.0.0.1:18192', ARRAY['/api/v2/mirror-leave'], 'ready', 1, NULL)"
+          " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', address = EXCLUDED.address, worker = NULL, seen = now()")
+        check(await settle(lambda: listing(gw, tok).get(("mirror", "leave"), {}).get("state") == "ready", 3, "leave"), "mirror/leave ready")
+        q("UPDATE gateway.node SET state = 'offline', address = '10.9.9.9:80' WHERE module = 'mirror' AND instance = 'leave'")
+        check(await settle(lambda: listing(gw, tok)[("mirror", "leave")]["state"] == "offline", 1.5, "leave off"),
+              "offline carrying a refused address — taken within a NOTIFY, not a reload")
+        check(listing(gw, tok)[("mirror", "leave")]["address"] == "127.0.0.1:18192", "…the state only: the address kept")
+
+        # 10. Startup reload is covered indirectly: the peer started earlier and learned mirror/*
         #    via NOTIFY; rows inserted into the database BEFORE the worker started arrive on the
         #    first reload — visible as the line 'mirror: reload' in the new process's error.log
         #    (checked manually).

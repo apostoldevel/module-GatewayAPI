@@ -302,7 +302,19 @@ private:
     /// transaction; then reconcile: own rows re-asserted, foreign rows
     /// mirrored, mirrored rows that are gone → offline.
     void mirror_reload();
-    void mirror_apply(const nlohmann::json& row, std::string_view why);
+    /// Mirror a row of another worker into the table; false — the row was
+    /// refused (mirror_refusal) and nothing changed. A known instance leaving
+    /// rotation (any state but ready) takes the state even from a refused row.
+    bool mirror_apply(const nlohmann::json& row, std::string_view why);
+    /// The /register checks on a row that did not come through /register —
+    /// a NOTIFY (any role with CONNECT can issue one) or a row read back:
+    /// names, `address` an IPv4 literal inside allowed_cidr, `prefixes` a
+    /// non-empty array of valid prefixes overlapping neither each other nor a
+    /// live instance of another module. Empty — admissible; else the reason.
+    std::string mirror_refusal(const nlohmann::json& row) const;
+    /// mirror_refusal() that logs a refusal, throttled.
+    bool mirror_admissible(const nlohmann::json& row, std::string_view why);
+    void mirror_refused(const nlohmann::json& row, std::string_view why, std::string_view reason);
     /// NOTIFY `gateway` — the trigger's payload {op, module, instance, state,
     /// state_from, address, prefixes, worker}. Own writes come back too.
     void on_gateway_notify(std::string_view payload);
@@ -358,6 +370,8 @@ private:
     std::chrono::system_clock::time_point next_seen_{};
     std::chrono::system_clock::time_point next_reload_{};
     std::chrono::system_clock::time_point mirror_warned_{};
+    std::chrono::system_clock::time_point refused_warned_{};   // mirror_refused: once per reload_interval
+    int                                   refused_quiet_{0};    // refusals not logged since
     struct MirrorWrite { std::string sql; std::string what; PgQuery::ResultHandler on_result; std::string kind; };
     std::deque<MirrorWrite> mirror_queue_;
     bool mirror_busy_{false};
