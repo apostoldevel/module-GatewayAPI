@@ -186,7 +186,7 @@ module ──► instance ──► { address, prefixes[], state, capacity,
                           last_heartbeat, owner_node, owner_worker, source ∈ {socket, mirror} }
 ```
 
-**Route resolution:** the longest prefix, among the instances in `ready` that carry it. **Instance choice:** the least local `in_flight`; ties by round robin. No prefix covers the path → `404 no-route`; a prefix exists but no instance is `ready` → `503 no-instance` with `Retry-After: 1`. Prefix matching is by path segment: `/api/v2/clients` covers `/api/v2/clients` and `/api/v2/clients/…`, not `/api/v2/clients2`.
+**Route resolution:** the longest prefix, among the instances in `ready` that carry it. **Instance choice:** the least local `in_flight`; ties by round robin. No prefix covers the path → `404 no-route` — once the worker has read the table; before its first re-read → `503 routes-loading` with `Retry-After: 1`; a prefix exists but no instance is `ready` → `503 no-instance` with `Retry-After: 1`. Tell them apart by `type`, not by `detail`. Prefix matching is by path segment: `/api/v2/clients` covers `/api/v2/clients` and `/api/v2/clients/…`, not `/api/v2/clients2`.
 
 Data plane
 -
@@ -232,7 +232,8 @@ Everything the gateway answers on its own is `application/problem+json` (RFC 945
 | `404` | `unknown-instance` | a command for an instance the worker's table does not know, or knows `offline` | |
 | `405` | `method-not-allowed` | `PUT` / `PATCH` / `DELETE` on the control path | `Allow: GET, POST` |
 | `502` | `upstream-error` | connection or answer failed, retry impossible or exhausted | |
-| `503` | `no-instance` | the route exists, no instance is `ready`; or no prefix covers the path **before the worker's first re-read** (detail `routing table not loaded yet`) — a fresh worker (a restart by the master, `SIGHUP`) knows only its own sockets until then; the same for a command's instance | `Retry-After: 1` |
+| `503` | `no-instance` | the route exists, no instance is `ready` | `Retry-After: 1` |
+| `503` | `routes-loading` | no prefix covers the path **before the worker's first re-read** (contract edition 6, K7) — a fresh worker (a restart by the master, `SIGHUP`) knows only its own sockets until then, so "no route" is not known yet; the same for a command's instance. After three re-reads that fail with an error (no schema, no grant — not a database that is merely away) the worker stops waiting and answers `404 no-route` from its own sockets (logged `routing table not loaded after N failed reloads`) | `Retry-After: 1` |
 | `503` | `database-unavailable` | a command to relay (another worker holds the socket), and the database refused it or did not take it within 9 s, or this worker is not listening on `gateway_cmd` yet | `Retry-After: 1` |
 | `504` | `upstream-timeout` | no complete answer within `response_timeout_ms`; a command not answered in 5 s; a relayed command no worker answered in 9 s | |
 | other | `refresh-refused`, `internal` | the database refused the refresh with a status other than 401; an internal error | |

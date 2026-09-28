@@ -315,7 +315,8 @@ private:
     /// address, not by row, because the failed row may be swept or replaced
     /// by the time the failure is reported. Empty — no exclusion. nullptr with
     /// `covered` false → 404 no-route (no prefix of any instance, in any state,
-    /// covers the path); nullptr with `covered` true → 503 no-instance.
+    /// covers the path), or 503 routes-loading before the first reload;
+    /// nullptr with `covered` true → 503 no-instance.
     /// Only `ready` is in rotation: suspect, draining, overloaded, offline are
     /// out (README § Instance states).
     Instance* pick_instance(std::string_view path, std::string_view avoid_address, bool& covered);
@@ -412,6 +413,7 @@ private:
                                    std::string& module, std::string& instance,
                                    std::string& command);
     static std::string_view miss_detail(bool covered);
+    static std::string_view miss_slug(bool covered);
     static bool valid_name(std::string_view s);
     static bool valid_prefix(std::string_view s);
     static bool parse_address(std::string_view address, std::string& host, uint16_t& port);

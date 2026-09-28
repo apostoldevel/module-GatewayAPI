@@ -449,7 +449,7 @@ void GatewayAPI::do_get(const HttpRequest& req, HttpResponse& resp)
         const auto* inst = pick_instance(path, {}, covered);
         if (!inst) {
             if (covered || !table_loaded_) {
-                reply_problem(resp, 503, "no-instance", "Service Unavailable", miss_detail(covered), path);
+                reply_problem(resp, 503, miss_slug(covered), "Service Unavailable", miss_detail(covered), path);
                 resp.set_header("Retry-After", "1");
             } else {
                 reply_problem(resp, 404, "no-route", "Not Found", "no prefix covers the path", path);
@@ -525,7 +525,7 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
     const auto* known = find_instance(module, instance);
     if (!known || known->state == "offline") {
         if (!table_loaded_) {
-            reply_problem(resp, 503, "no-instance", "Service Unavailable", miss_detail(false), req.path);
+            reply_problem(resp, 503, miss_slug(false), "Service Unavailable", miss_detail(false), req.path);
             resp.set_header("Retry-After", "1");
         } else {
             reply_problem(resp, 404, "unknown-instance", "Not Found",
@@ -1125,9 +1125,11 @@ void GatewayAPI::execute(const HttpRequest& req, std::shared_ptr<HttpConnection>
         // sockets: a path no prefix covers yet may well be served by an
         // instance of another worker — a fresh worker (a restart by the
         // master, SIGHUP) would answer 404 for a second or two. Not yet known
-        // is 503 + Retry-After, the same answer as a route with nothing ready.
+        // is 503 + Retry-After, like a route with nothing ready — under a slug
+        // of its own, routes-loading (contract edition 6, K7): a client
+        // branches on type, not on detail.
         if (covered || !table_loaded_)
-            answer_problem(conn, ctx, 503, "no-instance", "Service Unavailable", miss_detail(covered), req.path, request_id, /*retry_after=*/true);
+            answer_problem(conn, ctx, 503, miss_slug(covered), "Service Unavailable", miss_detail(covered), req.path, request_id, /*retry_after=*/true);
         else
             answer_problem(conn, ctx, 404, "no-route", "Not Found", "no prefix covers the path", req.path, request_id);
         return;
@@ -1241,6 +1243,13 @@ void GatewayAPI::answer_problem(const std::shared_ptr<HttpConnection>& conn, con
 std::string_view GatewayAPI::miss_detail(bool covered)
 {
     return covered ? "route exists, no instance is ready" : "routing table not loaded yet";
+}
+
+// Called only on a 503: covered → a route with nothing ready; not covered →
+// the table has not been read yet, so "no route" is not known (K7, ed. 6).
+std::string_view GatewayAPI::miss_slug(bool covered)
+{
+    return covered ? "no-instance" : "routes-loading";
 }
 
 // ─── table ───────────────────────────────────────────────────────────────────

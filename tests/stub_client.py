@@ -1030,7 +1030,7 @@ async def scenario_fresh_worker(gw, tok, peer, peer_master):
                 seen[r.status_code] += 1
                 if r.status_code != 200:
                     try:
-                        detail = r.json().get("detail")
+                        detail = r.json().get("type", "").rsplit(":", 1)[-1] + ": " + str(r.json().get("detail"))
                     except ValueError:
                         detail = r.text[:60]
                     details[(r.status_code, r.headers.get("Retry-After"), detail)] += 1
@@ -1040,6 +1040,9 @@ async def scenario_fresh_worker(gw, tok, peer, peer_master):
         check(respawned == 3, f"the peer's master spawned fresh workers on every SIGHUP ({respawned}/3)")
         check(seen[404] == 0, f"no 404 from a fresh worker ({seen[404]})")
         check(all(ra == "1" for (st, ra, _), n in details.items() if st == 503), "every 503 carries Retry-After: 1")
+        # Contract edition 6, K7: "not loaded yet" has a slug of its own — a client branches on type, not on detail.
+        check(seen[503] > 0 and all(d.startswith("routes-loading:") for (st, _, d), n in details.items() if st == 503),
+              f"every 503 of a fresh worker is routes-loading, not no-instance ({seen[503]} of them)")
         check(seen[200] > 0, "the instance is served through the peer between the reloads")
     finally:
         if ws is not None:
