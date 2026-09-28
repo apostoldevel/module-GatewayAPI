@@ -51,6 +51,14 @@ int int_or(const nlohmann::json& o, const char* key, int def)
     return it != o.end() && it->is_number_integer() ? it->get<int>() : def;
 }
 
+// gateway.node.node is nullable: NULL (a binary that does not write it), or
+// absent from an older trigger's payload — both read as "".
+std::string node_of(const nlohmann::json& o)
+{
+    auto it = o.find("node");
+    return it != o.end() && it->is_string() ? it->get<std::string>() : std::string{};
+}
+
 } // namespace
 
 // ─── ctor / config ───────────────────────────────────────────────────────────
@@ -59,9 +67,24 @@ GatewayAPI::GatewayAPI(Application& app)
     : AppServer(app)
     , loop_(app.worker_loop())
     , db_(app.db_pool())
+    , node_(app.node_id())
     , pid_(static_cast<int>(::getpid()))
+    , self_(app.node_process_id())
 {
     add_allowed_header("Authorization");
+
+    // The identity goes into a request header (X-Gateway-Worker), the log and
+    // JSON answers: a NODE_NAME with a control byte, a space or a non-ASCII
+    // byte would split a header or make a dump() throw. Anything outside
+    // printable ASCII becomes '_' — for this module only.
+    if (node_.empty() || !std::all_of(node_.begin(), node_.end(), [](unsigned char c) { return c > 0x20 && c < 0x7F; })) {
+        std::string clean = node_.empty() ? std::string("_") : node_;
+        for (auto& c : clean)
+            if (static_cast<unsigned char>(c) <= 0x20 || static_cast<unsigned char>(c) >= 0x7F) c = '_';
+        log_.warn("GatewayAPI: node identity has bytes outside printable ASCII (or is empty) — used as '{}'", clean);
+        node_ = std::move(clean);
+        self_ = fmt::format("{}:{}", node_, pid_);
+    }
 
     if (const auto* cfg = app.module_config("GatewayAPI")) {
         control_path_        = cfg->value("control_path", control_path_);
@@ -130,8 +153,8 @@ GatewayAPI::GatewayAPI(Application& app)
         log_.error("GatewayAPI: audience '{}' ({}) has an empty client_secret — every module will be refused (unauthorized)",
                    audience_, aud_app->client_id);
 
-    log_.notice("GatewayAPI: control_path={} heartbeat_interval={}s suspect_after={} offline_after={} audience={} cidr={}",
-                control_path_, heartbeat_interval_, suspect_after_, offline_after_, audience_,
+    log_.notice("GatewayAPI: {} control_path={} heartbeat_interval={}s suspect_after={} offline_after={} audience={} cidr={}",
+                self_, control_path_, heartbeat_interval_, suspect_after_, offline_after_, audience_,
                 allowed_cidr_.size());
 }
 
@@ -407,6 +430,7 @@ void GatewayAPI::do_get(const HttpRequest& req, HttpResponse& resp)
             return;
         }
         json out = {
+            {"gateway_node",   self_},
             {"gateway_worker", pid_},
             {"path",     path},
             {"module",   inst->module},
@@ -418,6 +442,7 @@ void GatewayAPI::do_get(const HttpRequest& req, HttpResponse& resp)
         return;
     }
     json out = {
+        {"gateway_node",   self_},
         {"gateway_worker", pid_},
         {"heartbeat_interval", heartbeat_interval_},
         {"suspect_after", suspect_after_},
@@ -656,8 +681,7 @@ void GatewayAPI::drop_node(const std::shared_ptr<Node>& node)
     // (EOF, reset, protocol error) is recorded here. A replaced node has
     // registered=false, so it never touches the row now owned by its successor.
     if (node->registered && !node->closing)
-        if (auto* inst = find_instance(node->module, node->instance);
-            inst && inst->source == Source::socket && inst->owner_worker == pid_)
+        if (auto* inst = find_instance(node->module, node->instance); inst && owns(*inst))
             set_state(*inst, "offline", "socket closed");
     log_.notice("GatewayAPI: {}/{} disconnected (fd={})", node->module, node->instance, fd);
     // `node` and its WsConnection die here: TcpConnection closes the fd.
@@ -822,6 +846,24 @@ void GatewayAPI::handle_register(const std::shared_ptr<Node>& node, const std::s
 
     // 403 — network
     if (!address_allowed(host)) { fail(403, fmt::format("address {} is outside allowed_cidr", host)); return; }
+
+    // 422 — a row whose NOTIFY would not fit: pg_notify refuses a payload of
+    // 8000 bytes or more, the upsert fails with it, and the instance never
+    // reaches the other workers. The trigger's json_build_object writes
+    // "key" : value, ... — two bytes per key and one per element more than a
+    // compact dump — and `updated` as a timestamp of up to 35 characters.
+    {
+        const json probe = {{"op", "UPDATE"}, {"module", node->module}, {"instance", node->instance},
+                            {"state", "overloaded"}, {"state_from", "overloaded"}, {"address", p["address"]},
+                            {"prefixes", prefixes}, {"worker", pid_}, {"node", node_},
+                            {"updated", std::string(35, '0')}};
+        const std::size_t bytes = probe.dump().size() + 3 * probe.size() + prefixes.size();
+        if (bytes > k_notify_max_bytes) {
+            fail(422, fmt::format("registration too large for the mirror NOTIFY ({} bytes, the channel carries {})",
+                                  bytes, k_notify_max_bytes));
+            return;
+        }
+    }
     if (host != node->peer_ip)
         log_.warn("GatewayAPI: {}/{}: address {} differs from socket peer {} (allowed)",
                   node->module, node->instance, host, node->peer_ip);
@@ -872,6 +914,7 @@ void GatewayAPI::handle_register(const std::shared_ptr<Node>& node, const std::s
     inst.conn_errors = 0;
     inst.registered = now;
     inst.last_heartbeat = now;
+    inst.owner_node   = node_;
     inst.owner_worker = pid_;
     inst.source    = Source::socket;
 
@@ -891,6 +934,7 @@ void GatewayAPI::handle_register(const std::shared_ptr<Node>& node, const std::s
     send_call_result(*node->ws, u, {
         {"heartbeat_interval", heartbeat_interval_},
         {"instance_id",        node->instance},
+        {"gateway_node",       self_},
         {"gateway_worker",     pid_},
         {"suspect_after",      suspect_after_},
         {"offline_after",      offline_after_},
@@ -1302,7 +1346,7 @@ std::string GatewayAPI::shape_upstream(HttpRequest& up, std::string_view at) con
     }
     kept.emplace_back("X-Forwarded-For", std::move(forwarded_for));
     kept.emplace_back("X-Forwarded-Proto", "https");
-    kept.emplace_back("X-Gateway-Worker", std::to_string(pid_));
+    kept.emplace_back("X-Gateway-Worker", self_);   // "<node>:<pid>" (README § Identity)
 
     up.headers = std::move(kept);
     return request_id;
@@ -1340,6 +1384,7 @@ json GatewayAPI::table_json() const
                 {"conn_errors",  inst.conn_errors},
                 {"registered_s", seconds_since(inst.registered, now)},
                 {"seen_s",       seconds_since(inst.last_heartbeat, now)},
+                {"owner_node",   inst.owner_node.empty() ? json(nullptr) : json(inst.owner_node)},
                 {"owner_worker", inst.owner_worker},
                 {"source",       inst.source == Source::socket ? "socket" : "mirror"},
             });
@@ -1478,7 +1523,7 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
 
         // suspect / offline by the clock, not by a counter (README § Instance states).
         auto* inst = find_instance(node->module, node->instance);
-        if (!inst || inst->owner_worker != pid_ || inst->source != Source::socket) continue;
+        if (!inst || !owns(*inst)) continue;
         const int silent = seconds_since(inst->last_heartbeat, now);
         if (silent >= offline_after_ * heartbeat_interval_) {
             set_state(*inst, "offline", fmt::format("no heartbeat for {} s", silent));
@@ -1601,19 +1646,24 @@ void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason
             pq_quote_literal(pre_reason), sql_ident(inst.module, inst.instance));
     sql += fmt::format(
         "SELECT set_config('gateway.reason', {}, true);\n"
-        "INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker, registered, seen, updated)\n"
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, now(), now(), now())\n"
+        "INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker, node, registered, seen, updated)\n"
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, now(), now(), now())\n"
         "ON CONFLICT (module, instance) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address,\n"
         "  prefixes = EXCLUDED.prefixes, state = EXCLUDED.state, capacity = EXCLUDED.capacity, worker = EXCLUDED.worker,\n"
-        "  registered = {}, seen = now(), updated = now(){};",
+        "  node = EXCLUDED.node, registered = {}, seen = now(), updated = now(){};",
         pq_quote_literal(reason),
         pq_quote_literal(inst.module), pq_quote_literal(inst.instance), pq_quote_literal(inst.version),
         pq_quote_literal(inst.address), sql_prefixes(inst.prefixes), pq_quote_literal(inst.state),
-        inst.capacity, pid_,
+        inst.capacity, pid_, pq_quote_literal(node_),
         reassert ? "gateway.node.registered" : "now()",
         // A re-assert answers a snapshot; a register is the event itself and
-        // overrides whatever the row says.
-        reassert ? fmt::format("\n  WHERE gateway.node.worker = {} OR gateway.node.state = 'offline'", pid_) : "");
+        // overrides whatever the row says. `node` is set on both branches: a
+        // binary that does not know the column leaves it as it was on its own
+        // ON CONFLICT, so a row may carry another worker's node next to its
+        // pid — the pair, never the pid alone, says whose it is.
+        reassert ? fmt::format("\n  WHERE (gateway.node.node = {} AND gateway.node.worker = {}) OR gateway.node.state = 'offline'",
+                               pq_quote_literal(node_), pid_)
+                 : std::string{});
     // One simple-protocol query string: the statements run as ONE transaction
     // (no explicit BEGIN), so the transaction-local GUC reaches the trigger
     // and both NOTIFYs leave on the same commit, in this order.
@@ -1625,16 +1675,19 @@ void GatewayAPI::mirror_state(const Instance& inst, std::string_view reason)
 {
     mirror_exec(fmt::format(
         "SELECT set_config('gateway.reason', {}, true);\n"
-        "UPDATE gateway.node SET state = {}, updated = now() WHERE {} AND worker = {};",
-        pq_quote_literal(reason), pq_quote_literal(inst.state), sql_ident(inst.module, inst.instance), pid_),
+        "UPDATE gateway.node SET state = {}, updated = now() WHERE {} AND node = {} AND worker = {};",
+        pq_quote_literal(reason), pq_quote_literal(inst.state), sql_ident(inst.module, inst.instance),
+        pq_quote_literal(node_), pid_),
         fmt::format("state {}/{} -> {}", inst.module, inst.instance, inst.state));
     inst.written = mirror_seq_;
-    // `AND worker = pid`: the FIFO orders this worker's writes against each
-    // other, not against another worker's. A transition queued here before
-    // the NOTIFY of a takeover arrives, landing after the taker's upsert,
-    // would otherwise re-claim the row — and the taker, reading a foreign
-    // pid on its own live instance, would close its fresh socket. Every
-    // caller either owns the row or has just read worker == pid from it.
+    // `AND node AND worker`: the FIFO orders this worker's writes against
+    // each other, not against another worker's. A transition queued here
+    // before the NOTIFY of a takeover arrives, landing after the taker's
+    // upsert, would otherwise re-claim the row — and the taker, reading a
+    // foreign identity on its own live instance, would close its fresh
+    // socket. Every caller either owns the row or has just read this
+    // worker's (node, pid) from it. The pid alone would match the row of a
+    // worker in another pod that happens to share it.
 }
 
 void GatewayAPI::mirror_seen(clock_t_::time_point now)
@@ -1652,8 +1705,8 @@ void GatewayAPI::mirror_seen(clock_t_::time_point now)
             rows += fmt::format("({}, {})", pq_quote_literal(inst.module), pq_quote_literal(inst.instance));
         }
     if (rows.empty()) return;
-    mirror_exec(fmt::format("UPDATE gateway.node SET seen = now() WHERE worker = {} AND (module, instance) IN ({});",
-                            pid_, rows),
+    mirror_exec(fmt::format("UPDATE gateway.node SET seen = now() WHERE node = {} AND worker = {} AND (module, instance) IN ({});",
+                            pq_quote_literal(node_), pid_, rows),
                 "seen", {}, "seen");
 }
 
@@ -1665,20 +1718,23 @@ void GatewayAPI::mirror_reload()
     // the sweep and it only ever finishes what a dead worker left behind.
     // By `seen`, not by pid: a gateway replica in another container sees no
     // pid of ours, and kill -0 there would read every live row as dead.
-    // Own rows are excluded — a stale `seen` of this pid is a row of a
-    // previous life of this pid, or a database that was away: both are
-    // settled below, by socket, not by age. The read carries the whole row
-    // as JSON so text[] never has to be parsed here.
+    // Own rows — (node, pid) of this worker — are excluded: a stale `seen` of
+    // ours is a row of a previous life of this identity, or a database that
+    // was away; both are settled below, by socket, not by age. A row with
+    // our pid and another node, or no node at all, is another worker's and
+    // ages like any. The read carries the whole row as JSON so text[] never
+    // has to be parsed here.
     const int stale_s = (offline_after_ + 1) * heartbeat_interval_;
     std::string sql = fmt::format(
         "SELECT set_config('gateway.reason', {}, true);\n"
         "UPDATE gateway.node SET state = 'offline', updated = now()\n"
-        " WHERE state <> 'offline' AND worker IS DISTINCT FROM {} AND seen < now() - make_interval(secs => {});\n"
+        " WHERE state <> 'offline' AND (node, worker) IS DISTINCT FROM ({}, {}) AND seen < now() - make_interval(secs => {});\n"
         "SELECT coalesce(json_agg(n), '[]'::json)::text FROM (\n"
-        "  SELECT module, instance, version, address, prefixes, state, capacity, worker,\n"
+        "  SELECT module, instance, version, address, prefixes, state, capacity, worker, node,\n"
         "         extract(epoch FROM now() - seen)::int AS seen_s, extract(epoch FROM now() - registered)::int AS registered_s\n"
         "    FROM gateway.node WHERE state <> 'offline') n;",
-        pq_quote_literal(fmt::format("swept by worker {}: seen older than {} s", pid_, stale_s)), pid_, stale_s);
+        pq_quote_literal(fmt::format("swept by worker {}: seen older than {} s", self_, stale_s)),
+        pq_quote_literal(node_), pid_, stale_s);
 
     // The writes of this worker run in one queue, in order: one queued after
     // this reload lands after its snapshot. An own row the snapshot shows
@@ -1740,7 +1796,7 @@ void GatewayAPI::mirror_reload()
             if (!row.is_object() || !row.contains("module") || !row.contains("instance")) continue;
             const std::string module = row["module"].get<std::string>();
             const std::string instance = row["instance"].get<std::string>();
-            const int worker = int_or(row, "worker", 0);
+            const bool me = row_is_me(row);
             seen[module][instance] = true;
 
             auto* mine = find_instance(module, instance);
@@ -1751,11 +1807,13 @@ void GatewayAPI::mirror_reload()
                 if (row.contains("registered_s") && row["registered_s"].is_number() &&
                     now - std::chrono::seconds(row["registered_s"].get<int>()) < mine->registered - std::chrono::seconds(1))
                     continue;
-                if (worker != pid_) {
-                    // A NOTIFY we missed: another worker holds the instance now.
-                    // A row we would refuse is not a takeover — the socket stays.
+                if (!me) {
+                    // A NOTIFY we missed: another worker holds the instance now
+                    // — another (node, pid), a row with our pid under another
+                    // node or none included. A row we would refuse is not a
+                    // takeover — the socket stays.
                     if (mirror_admissible(row, "reload")) {
-                        take_over(module, instance, worker);
+                        take_over(module, instance, row_identity(row));
                         mirror_apply(row, "reload");
                         claim(row);
                     }
@@ -1776,10 +1834,13 @@ void GatewayAPI::mirror_reload()
                 }
                 continue;
             }
-            if (worker == pid_) {
-                // The row claims this pid and there is no socket behind it:
-                // a previous life of this pid, or a socket closed while the
-                // database was away. Close it in the database.
+            if (me) {
+                // The row names this worker (node and pid) and there is no
+                // socket behind it: a previous life of this identity, or a
+                // socket closed while the database was away. Close it in the
+                // database. A row with our pid alone is not ours — another
+                // pod's worker with the same pid, or a binary that writes no
+                // node — and is mirrored below like any foreign row.
                 Instance gone;
                 gone.module = module; gone.instance = instance; gone.state = "offline";
                 mirror_state(gone, "no socket on worker");
@@ -1944,6 +2005,7 @@ bool GatewayAPI::mirror_apply(const json& row, std::string_view why)
     inst.address = row["address"].get<std::string>();   // both checked by mirror_refusal
     parse_address(inst.address, inst.host, inst.port);
     inst.prefixes = row["prefixes"].get<std::vector<std::string>>();
+    inst.owner_node   = node_of(row);
     inst.owner_worker = int_or(row, "worker", 0);
     inst.source       = Source::mirror;
     inst.conn_errors  = 0;   // the owner hears it; our passive count starts over
@@ -1953,13 +2015,13 @@ bool GatewayAPI::mirror_apply(const json& row, std::string_view why)
         inst.registered = row.contains("registered_s") && row["registered_s"].is_number()
                             ? now - std::chrono::seconds(row["registered_s"].get<int>()) : now;
     if (fresh || inst.state != state) {
-        log_.notice("GatewayAPI: {}/{} {} -> {} (mirror: {}, worker {})", module, instance, from, state, why, inst.owner_worker);
+        log_.notice("GatewayAPI: {}/{} {} -> {} (mirror: {}, worker {})", module, instance, from, state, why, row_identity(row));
         inst.state = state;
     }
     return true;
 }
 
-void GatewayAPI::take_over(const std::string& module, const std::string& instance, int by_worker)
+void GatewayAPI::take_over(const std::string& module, const std::string& instance, std::string_view by)
 {
     // The database says another worker holds this instance now — the module
     // reconnected there (its old socket to us may still be open, or the
@@ -1968,7 +2030,7 @@ void GatewayAPI::take_over(const std::string& module, const std::string& instanc
     // theirs, alone.
     if (auto node = socket_of(module, instance)) {
         log_.notice("GatewayAPI: {}/{}: replaced by worker {} — closing our socket fd={}", module, instance,
-                    by_worker, node->ws->fd());
+                    by, node->ws->fd());
         node->registered = false;
         close_node(node, 1001, "replaced");
     }
@@ -1990,33 +2052,107 @@ void GatewayAPI::on_gateway_notify_(std::string_view payload)
     const std::string module   = msg.value("module", "");
     const std::string instance = msg.value("instance", "");
     const std::string op       = msg.value("op", "");
-    const int         worker   = int_or(msg, "worker", 0);
     if (module.empty() || instance.empty()) return;
     if (op == "DELETE") msg["state"] = "offline";
+    // `node` names the row's holder, `updated` is now() of the writing
+    // transaction — neither is a version: two NOTIFYs are never ordered by it.
 
     auto* mine = find_instance(module, instance);
-    if (mine && owns(*mine) && worker == pid_ && !socket_of(module, instance)) {
+    const bool me = row_is_me(msg);
+    if (mine && owns(*mine) && me && !socket_of(module, instance)) {
         // The echo of our own offline for a socket already gone: memory has
         // it; mirroring it back would re-stamp the row source=mirror.
         if (msg.value("state", "") == "offline") mine->state = "offline";
         return;
     }
     if (mine && owns(*mine) && socket_of(module, instance)) {
-        // Our row. `worker` in the payload is the row's column, not the writer:
-        // our own writes come back with our pid, and so does a sweep of our row
-        // by another worker. Neither is acted on here — the socket is the
-        // truth, and the reload re-asserts a row the database has wrong. Acting
-        // on the offline would fight the register of a worker taking the
-        // instance over (its offline step keeps our pid) — the ready that
-        // follows, with ITS pid, is the takeover.
+        // Our row. `node`/`worker` in the payload are the row's columns, not
+        // the writer: our own writes come back with our identity, and so does
+        // a sweep of our row by another worker. Neither is acted on here —
+        // the socket is the truth, and the reload re-asserts a row the
+        // database has wrong. Acting on the offline would fight the register
+        // of a worker taking the instance over (its offline step keeps our
+        // identity) — the ready that follows, with ITS identity, is the
+        // takeover.
+        //
+        // And even that one is only a signal: the payload is whatever the
+        // sender put there — pg_notify is open to any role with CONNECT, a
+        // copy of a real address and prefix passes every check — and a stale
+        // one (a takeover the module has since undone by reconnecting here)
+        // is as good as forged. Closing a live socket on it would be the
+        // forger's choice; the row is read back and the takeover acts on it.
         const std::string state = msg.value("state", "");
-        if (worker != pid_ && !state.empty() && state != "offline" && mirror_admissible(msg, "notify")) {
-            take_over(module, instance, worker);
-            mirror_apply(msg, "notify");
-        }
+        if (!me && !state.empty() && state != "offline")
+            mirror_reread(module, instance);
         return;
     }
     mirror_apply(msg, "notify");
+}
+
+void GatewayAPI::mirror_reread(const std::string& module, const std::string& instance)
+{
+    // In the FIFO: behind this worker's own queued writes, so the row read is
+    // the one they leave. An upsert of ours queued after the read (the module
+    // reconnected here while it was in flight) settles the row instead.
+    const std::uint64_t snapshot = mirror_seq_ + 1;   // the seq mirror_exec gives this read
+    mirror_exec(fmt::format(
+        "SELECT coalesce((SELECT row_to_json(n)::text FROM (\n"
+        "  SELECT module, instance, version, address, prefixes, state, capacity, worker, node,\n"
+        "         extract(epoch FROM now() - seen)::int AS seen_s, extract(epoch FROM now() - registered)::int AS registered_s\n"
+        "    FROM gateway.node WHERE {}) n), 'null');",
+        sql_ident(module, instance)),
+        fmt::format("re-read {}/{}", module, instance),
+        [this, module, instance, snapshot](std::vector<PgResult> results) {
+            if (results.empty() || results.back().rows() != 1) throw std::runtime_error("no result row");
+            const json row = json::parse(results.back().value(0, 0));
+            auto* mine = find_instance(module, instance);
+            const bool held = mine && owns(*mine) && socket_of(module, instance);
+            if (!row.is_object()) return;   // no row: ours is re-asserted by the reload, a mirror stays
+            if (row_is_me(row)) {
+                if (held)
+                    log_.debug("GatewayAPI: {}/{}: NOTIFY of a takeover not confirmed by gateway.node — socket kept",
+                                module, instance);
+                return;
+            }
+            if (held) {
+                if (mine->upserted > snapshot) return;   // our register behind the read settles the row
+                // As in the reload: a holder registered before our socket is a
+                // stale one (our own upsert failed, a late NOTIFY of its own),
+                // not a takeover — a real one registers after us.
+                if (row.contains("registered_s") && row["registered_s"].is_number() &&
+                    clock_t_::now() - std::chrono::seconds(row["registered_s"].get<int>()) <
+                        mine->registered - std::chrono::seconds(1))
+                    return;
+                const std::string state = row.value("state", "");
+                if (state.empty() || state == "offline") return;   // not a takeover; the reload re-asserts ours
+                if (mirror_admissible(row, "notify re-read")) {
+                    take_over(module, instance, row_identity(row));
+                    mirror_apply(row, "notify re-read");
+                }
+                return;
+            }
+            mirror_apply(row, "notify re-read");
+        },
+        // One outstanding re-read per instance: a burst of NOTIFYs — a loop of
+        // forged ones included — costs one read, not one per message.
+        fmt::format("reread {}/{}", module, instance));
+}
+
+bool GatewayAPI::row_is_me(const json& row) const
+{
+    auto it = row.find("node");
+    return it != row.end() && it->is_string() && it->get<std::string>() == node_ && int_or(row, "worker", 0) == pid_;
+}
+
+std::string GatewayAPI::row_identity(const json& row)
+{
+    // For the log: `node` of a payload is whatever the sender wrote — nothing
+    // of it may start a log line of its own, or run on for a page.
+    auto it = row.find("node");
+    std::string node = it != row.end() && it->is_string() ? it->get<std::string>().substr(0, 128) : std::string("(null)");
+    for (auto& c : node)
+        if (static_cast<unsigned char>(c) <= 0x20 || static_cast<unsigned char>(c) >= 0x7F) c = '?';
+    return fmt::format("{}:{}", node, int_or(row, "worker", 0));
 }
 
 // ─── commands across workers (gateway_cmd) ───────────────────────────────────
@@ -2043,6 +2179,20 @@ bool same_mac(std::string_view a, std::string_view b)
 }
 
 bool is_command(std::string_view c) { return c == "ping" || c == "drain" || c == "reload"; }
+
+// `from` / `by` of a signed message — "<node>:<pid>" of the worker that sent
+// it; a number from a sender that predates the identity. For the log only:
+// the answer is matched by the id. Signed, so not a forger's text — still
+// cut to what a log line can carry.
+std::string cmd_peer(const nlohmann::json& msg, const char* key)
+{
+    auto it = msg.find(key);
+    if (it == msg.end()) return "?";
+    std::string s = it->is_string() ? it->get<std::string>().substr(0, 128) : it->dump();
+    for (auto& c : s)
+        if (static_cast<unsigned char>(c) <= 0x20 || static_cast<unsigned char>(c) >= 0x7F) c = '?';
+    return s;
+}
 
 } // namespace
 
@@ -2081,7 +2231,7 @@ void GatewayAPI::relay_command(const std::string& module, const std::string& ins
     const auto        now = clock_t_::now();
     const std::string what = fmt::format("{}/{} {}", module, instance, command);
     const json body = {
-        {"k", "cmd"}, {"id", id}, {"from", pid_},
+        {"k", "cmd"}, {"id", id}, {"from", self_},
         {"module", module}, {"instance", instance}, {"command", command}, {"p", p},
         {"deadline", epoch_ms(now + std::chrono::seconds(k_relay_send_s))},
     };
@@ -2099,7 +2249,7 @@ void GatewayAPI::relay_command(const std::string& module, const std::string& ins
         return;
     }
     relays_[id] = Relay{std::move(http_conn), what, now};
-    log_.debug("GatewayAPI: {}: no socket on worker {} — relayed as {}", what, pid_, id);
+    log_.debug("GatewayAPI: {}: no socket on worker {} — relayed as {}", what, self_, id);
     cmd_notify(std::move(payload),
         [this, id]() { if (auto it = relays_.find(id); it != relays_.end()) it->second.notified = true; },
         [this, id](std::string_view error) {
@@ -2116,9 +2266,9 @@ void GatewayAPI::relay_command(const std::string& module, const std::string& ins
         });
 }
 
-void GatewayAPI::cmd_answer(const std::string& id, int to, const Answer& a)
+void GatewayAPI::cmd_answer(const std::string& id, const std::string& to, const Answer& a)
 {
-    json body = {{"k", "reply"}, {"id", id}, {"by", pid_}, {"status", a.status}};
+    json body = {{"k", "reply"}, {"id", id}, {"by", self_}, {"status", a.status}};
     if (a.status == 200) body["body"] = a.body;
     else { body["slug"] = a.slug; body["title"] = a.title; body["detail"] = a.detail; }
     std::string payload = cmd_sign(body);
@@ -2180,7 +2330,7 @@ void GatewayAPI::on_cmd_notify_(std::string_view payload)
         auto conn = std::move(it->second.http_conn);
         const std::string what = it->second.what;
         relays_.erase(it);
-        log_.debug("GatewayAPI: {}: answered {} by worker {}", what, a.status, int_or(msg, "by", 0));
+        log_.debug("GatewayAPI: {}: answered {} by worker {}", what, a.status, cmd_peer(msg, "by"));
         respond(conn, a);
         return;
     }
@@ -2197,7 +2347,7 @@ void GatewayAPI::on_cmd_notify_(std::string_view payload)
     auto node = socket_of(module, instance);
     if (!node) return;   // held elsewhere, or by nobody: the requester answers 504
 
-    const int  from     = int_or(msg, "from", 0);
+    const std::string from = cmd_peer(msg, "from");
     const auto now      = clock_t_::now();
     const long long due = msg.value("deadline", 0LL);
     if (epoch_ms(now) > due) {

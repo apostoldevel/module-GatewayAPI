@@ -103,11 +103,11 @@ The first frame, within **5 s** of the upgrade (otherwise close `1008`):
 The reply **is** `ready` — no separate `/status ready` is needed:
 
 ```json
-{"t":3,"u":"…","p":{"heartbeat_interval":5,"instance_id":"clients-7f3a","gateway_worker":41207,
-                    "suspect_after":2,"offline_after":4}}
+{"t":3,"u":"…","p":{"heartbeat_interval":5,"instance_id":"clients-7f3a","gateway_node":"backend-7c9f:41207",
+                    "gateway_worker":41207,"suspect_after":2,"offline_after":4}}
 ```
 
-All numbers come from the gateway's configuration; the module has none of its own and re-reads them at every registration. A refused registration answers CALLERROR (table below) and closes `1008`; `/register` is not repeated on the same socket.
+`gateway_node` is the identity of the worker that took the socket — `<node>:<pid>` (*Mirror*, **Identity**); `gateway_worker` is its pid alone, kept for readers that predate the identity. All numbers come from the gateway's configuration; the module has none of its own and re-reads them at every registration. A refused registration answers CALLERROR (table below) and closes `1008`; `/register` is not repeated on the same socket.
 
 ### `/heartbeat` — module → gateway
 
@@ -145,7 +145,7 @@ These are issued through the management endpoints below.
 | `403` | `address` outside `allowed_cidr` | close `1008` |
 | `404` | unknown `a` | lives |
 | `409` | a prefix of another module; a CALL before `/register` | on `/register` — close `1008`; otherwise lives |
-| `422` | `module` / `instance` differ from the URL; prefixes overlap within the request; `capacity` < 1; `state` outside the set | on `/register` — close `1008`; otherwise lives |
+| `422` | `module` / `instance` differ from the URL; prefixes overlap within the request; `capacity` < 1; `state` outside the set; a registration whose mirror notification would not fit into 8000 bytes (too many or too long prefixes) | on `/register` — close `1008`; otherwise lives |
 | `429` | heartbeat faster than `heartbeat_interval / 2` | lives, frame dropped |
 | `500` | internal error of the side | lives |
 
@@ -183,7 +183,7 @@ Every worker keeps the full table — its own sockets plus the other workers' in
 ```
 module ──► instance ──► { address, prefixes[], state, capacity,
                           in_flight (this worker's local counter), conn_errors,
-                          last_heartbeat, owner_worker, source ∈ {socket, mirror} }
+                          last_heartbeat, owner_node, owner_worker, source ∈ {socket, mirror} }
 ```
 
 **Route resolution:** the longest prefix, among the instances in `ready` that carry it. **Instance choice:** the least local `in_flight`; ties by round robin. No prefix covers the path → `404 no-route`; a prefix exists but no instance is `ready` → `503 no-instance` with `Retry-After: 1`. Prefix matching is by path segment: `/api/v2/clients` covers `/api/v2/clients` and `/api/v2/clients/…`, not `/api/v2/clients2`.
@@ -206,7 +206,7 @@ Upstream, on the copy that reaches the module:
 | `X-Request-Id` | UUID v4 **minted by the gateway**; a client-supplied one, if any, moves to `X-Client-Request-Id` and is not trusted |
 | `X-Forwarded-For` | **exactly one address**: the last element of the incoming header (a reverse proxy in front appends the real client address to whatever the client sent), or the peer address when there is none |
 | `X-Forwarded-Proto` | `https` |
-| `X-Gateway-Worker` | pid of the worker |
+| `X-Gateway-Worker` | identity of the worker, `<node>:<pid>` (*Mirror*, **Identity**) — a pid alone repeats between pods |
 | `User-Agent`, `Accept`, `Accept-Language`, `Content-Type`, `If-Match`, `If-None-Match`, `Idempotency-Key`, … | as received |
 | `Cookie` and hop-by-hop headers | **always removed** |
 
@@ -250,15 +250,17 @@ Connect: `connect_timeout_ms` (1 s). Answer, from sending the request to the las
 Mirror
 -
 
-The database half of the module is the **`gateway`** module of [db-platform](https://github.com/apostoldevel/db-platform): schema `gateway` with `node` (one row per instance: `module`, `instance`, `version`, `address`, `prefixes`, `state`, `capacity`, `worker`, `registered`, `seen`, `updated`), `log` (one row per transition: `state_from`, `state_to`, `worker`, `reason`), the view `route` (prefix → module → `instances_ready` / `instances_total`, for other applications) and the trigger that journals every transition and issues `pg_notify('gateway', {op, module, instance, state, state_from, address, prefixes, worker})`.
+The database half of the module is the **`gateway`** module of [db-platform](https://github.com/apostoldevel/db-platform): schema `gateway` with `node` (one row per instance: `module`, `instance`, `version`, `address`, `prefixes`, `state`, `capacity`, `worker`, `node`, `registered`, `seen`, `updated`), `log` (one row per transition: `state_from`, `state_to`, `worker`, `node`, `reason`), the view `route` (prefix → module → `instances_ready` / `instances_total`, for other applications) and the trigger that journals every transition and issues `pg_notify('gateway', {op, module, instance, state, state_from, address, prefixes, worker, node, updated})`. `updated` is `now()` of the writing transaction — not a version: two notifications are never ordered by it, and the gateway does not read it.
+
+**Identity.** A worker is the pair **(node, pid)**: `node` is the application's `node_id()` — the top-level `"node"` of the configuration, else `$NODE_NAME` (in Kubernetes, the pod name from the downward API), else the host name — and `pid` its process id. A pid alone repeats between pods and containers on one database, and two workers taking each other's rows for their own close them in turn every re-read. A row is a worker's own only when **both** `gateway.node.node` and `gateway.node.worker` are its; a row with `node` NULL — written by a gateway that does not know the column — is never anyone's own, whatever its pid. Every write sets `node` explicitly, on the `ON CONFLICT` branch too: a binary that does not know the column leaves it as it was, so while old and new gateways share a database a row may carry one worker's node next to another's pid, and the pair, never the pid, decides. The identity reads `<node>:<pid>` wherever it is shown: `gateway_node` of the `/register` reply and of the management answers, `X-Gateway-Worker`, the sender of a command between workers, the log. The column comes with the `gateway` module of db-platform 1.2 patch `P00000031`; a gateway of this version writes it on every statement and needs it in the database.
 
 **Who writes:** only the worker holding the instance's socket. On `/register` the existing row is first closed in the journal (`replaced` when a live socket was displaced here, `re-registered` otherwise) and then written `ready` (`registered`) — so the journal never shows `ready → ready` with a new address, and the other workers get an `offline` they can act on before the `ready` that re-points them. Every transition is an `UPDATE` with the reason passed to the trigger through the transaction-local GUC `gateway.reason`. `seen` moves **once per `heartbeat_interval`**, for the instances that heartbeated in it — the trigger stays silent on an `UPDATE` that changes no state, so a fleet of modules cannot turn the channel into a metronome. All writes of a worker go through one queue: the connection pool would otherwise reorder two statements sent back to back.
 
-**Who reads:** every worker `LISTEN`s `gateway` and applies the payload at once (it carries everything routing needs); every `reload_interval` it re-reads the whole table and reconciles — its own rows are re-asserted where the database disagrees (`owner re-asserted`), rows claiming its pid without a socket behind them are closed (`no socket on worker`), foreign rows are mirrored, mirrored rows gone from the table go `offline`. The first re-read runs right at start: until it lands, a miss is `503`, not `404`. With a libapostol that confirms `LISTEN` (`APOSTOL_PG_LISTEN_READY`) the worker also re-reads on every confirmation — the first subscription and each re-subscription after the pool replaced a lost listener — so a NOTIFY committed while the listener was down is found at once, not a `reload_interval` later. In the same transaction it sweeps rows of **other** workers whose `seen` is older than `(offline_after + 1) × heartbeat_interval` — one interval more than the owner's own clock, so a live owner always beats the sweep and it only finishes what a dead worker left behind. By `seen`, not by pid.
+**Who reads:** every worker `LISTEN`s `gateway` and applies the payload at once (it carries everything routing needs); every `reload_interval` it re-reads the whole table and reconciles — its own rows are re-asserted where the database disagrees (`owner re-asserted`), rows naming its identity without a socket behind them are closed (`no socket on worker`), foreign rows — a row with its pid and another node or none included — are mirrored, mirrored rows gone from the table go `offline`. The first re-read runs right at start: until it lands, a miss is `503`, not `404`. With a libapostol that confirms `LISTEN` (`APOSTOL_PG_LISTEN_READY`) the worker also re-reads on every confirmation — the first subscription and each re-subscription after the pool replaced a lost listener — so a NOTIFY committed while the listener was down is found at once, not a `reload_interval` later. In the same transaction it sweeps rows of **other** workers whose `seen` is older than `(offline_after + 1) × heartbeat_interval` — one interval more than the owner's own clock, so a live owner always beats the sweep and it only finishes what a dead worker left behind. By `seen`, not by pid; "other" is by identity.
 
-**Who is right:** a notification about its own row does not move a worker — the `worker` field of the payload is the row's column, not the writer's, and the offline step of another worker's `/register` still carries the previous pid. Only a `ready` with **another** pid acts on an owned row: the earlier socket is closed `1001 replaced`, the row becomes a mirror. With the database away the gateway routes from memory — its own sockets are the truth, foreign instances are the last known copy — and says so once per `reload_interval`.
+**Who is right:** a notification about its own row does not move a worker — `node` and `worker` of the payload are the row's columns, not the writer's, and the offline step of another worker's `/register` still carries the previous identity. Only a state other than `offline` with **another** identity acts on an owned row, and only as a signal: the worker reads the row back from `gateway.node` — behind its own queued writes — and acts on the row, not on the payload. If the row names another worker, the earlier socket is closed `1001 replaced` and the row becomes a mirror; if it still names this one (a forged or stale notification), the socket stays. A takeover whose notification was lost is found by the periodic re-read, which acts on the row the same way. With the database away the gateway routes from memory — its own sockets are the truth, foreign instances are the last known copy — and says so once per `reload_interval`.
 
-**What is trusted:** commands between workers are signed (*Commands across workers*); the mirror is not — its notifications come from a trigger. A row that did not come through `/register` — a NOTIFY payload or a row read back — gets the same checks before it touches the table: `address` an IPv4 literal inside `allowed_cidr`, `prefixes` a non-empty array of valid, non-overlapping prefixes. `pg_notify` is open to any role with `CONNECT`; without the checks a forged payload would point `/api/v2/*`, users' Bearer tokens included, at an address of its choosing. A refused row changes nothing — no new mirror, no re-pointed address, no takeover of a live socket — and is logged `mirror row refused (notify|reload): <why>`; a mirror whose row turns unacceptable on a re-read goes `offline`.
+**What is trusted:** commands between workers are signed (*Commands across workers*); the mirror is not — its notifications come from a trigger. A row that did not come through `/register` — a NOTIFY payload or a row read back — gets the same checks before it touches the table: `address` an IPv4 literal inside `allowed_cidr`, `prefixes` a non-empty array of valid, non-overlapping prefixes. `pg_notify` is open to any role with `CONNECT`; without the checks a forged payload would point `/api/v2/*`, users' Bearer tokens included, at an address of its choosing. A refused row changes nothing — no new mirror, no re-pointed address, no takeover of a live socket — and is logged `mirror row refused (notify|reload): <why>`; a mirror whose row turns unacceptable on a re-read goes `offline`. A payload that copies a real address and prefix passes these checks; it still cannot close a live socket, because a takeover acts on the row read back (**Who is right**), which only the gateway's database roles can write. What such a payload can still do is re-point **a mirror** — another worker's instance — within `allowed_cidr` until the next re-read or notification; a notification is trusted for the instances a worker only mirrors.
 
 Management endpoints
 -
@@ -270,21 +272,21 @@ All under `control_path`, with a Bearer token of the gateway audience; answers a
 The table of this worker:
 
 ```json
-{"gateway_worker":41207,"heartbeat_interval":5,"suspect_after":2,"offline_after":4,
+{"gateway_node":"backend-7c9f:41207","gateway_worker":41207,"heartbeat_interval":5,"suspect_after":2,"offline_after":4,
  "instances":[{"module":"clients","instance":"clients-7f3a","version":"0.1.0","build":"8c77181",
                "address":"172.18.0.9:8081","prefixes":["/api/v2/clients"],"capacity":64,
                "state":"ready","in_flight":3,"load":0.2,"local_in_flight":1,"conn_errors":0,
-               "registered_s":812,"seen_s":2,"owner_worker":41207,"source":"socket"}]}
+               "registered_s":812,"seen_s":2,"owner_node":"backend-7c9f","owner_worker":41207,"source":"socket"}]}
 ```
 
-`source` is `socket` for an instance registered with this worker and `mirror` for one learned from the database; `in_flight` is what the instance reported, `local_in_flight` this worker's own counter.
+`source` is `socket` for an instance registered with this worker and `mirror` for one learned from the database; `owner_node` / `owner_worker` — the identity of the worker holding the socket (`owner_node` null for a row written without it); `in_flight` is what the instance reported, `local_in_flight` this worker's own counter.
 
 ### `GET /gateway/route?path=/api/v2/…`
 
 Where the path would go from this worker right now — the same resolution the data plane runs, with the same `404` / `503`, without a request. It moves the round-robin cursor like a real request would.
 
 ```json
-{"gateway_worker":41207,"path":"/api/v2/clients/7","module":"clients","instance":"clients-7f3a",
+{"gateway_node":"backend-7c9f:41207","gateway_worker":41207,"path":"/api/v2/clients/7","module":"clients","instance":"clients-7f3a",
  "address":"172.18.0.9:8081","local_in_flight":1}
 ```
 
@@ -294,7 +296,7 @@ Sends the command over the instance's socket and answers with the module's CALLR
 
 #### Commands across workers
 
-Only the worker holding an instance's socket can talk to the module, and a worker has no address of its own — every worker, and every pod, shares the listening socket. So a command that lands elsewhere goes through the database: `NOTIFY gateway_cmd` carries it to every worker, the one holding the socket sends the CALL and puts the module's answer on the same channel, and the relaying worker matches the answer to the waiting request by the command's id.
+Only the worker holding an instance's socket can talk to the module, and a worker has no address of its own — every worker, and every pod, shares the listening socket. So a command that lands elsewhere goes through the database: `NOTIFY gateway_cmd` carries it to every worker, the one holding the socket sends the CALL and puts the module's answer on the same channel, and the relaying worker matches the answer to the waiting request by the command's id. A message names its sender by identity — `from` of a command, `by` of an answer, `<node>:<pid>` — for the log only.
 
 - **Signed.** `pg_notify` is open to any role with `CONNECT`, and `LISTEN` shows it every payload; an unsigned command would let any of them drain a module — irreversibly. A message is `<HMAC-SHA256 hex>.<json>`; the key is `HMAC-SHA256(client_secret of the audience, "apostol:gateway_cmd")` — a key of the channel's own, not the secret that signs the audience's tokens. Every gateway process verifies the audience's tokens, so every one has the secret; a message that fails the check is dropped and logged `gateway_cmd message refused: <why>`, once per `reload_interval` with a count. No secret configured — a relayed command is `500 internal`. **What the signature does not cover:** whoever holds the audience secret — with the default audience `service`, every module, which mints its own token with it — can sign too. A forged *command* gives a module nothing it lacks (its token opens `POST /gateway/…` anyway), but a module that may `LISTEN` can answer a command meant for another module before the real answer arrives. Where that matters, give the gateway an audience of its own.
 - **A deadline and an id.** A command carries a deadline 2 s ahead, and a holder that gets it later drops it: with the database away a query waits in the pool's queue and never fails, and a drain queued then must not run once the database is back. The relaying worker waits 9 s — past the deadline, the holder's own 5 s and its clock tick — so the answer of any holder that took the command arrives first; with none, it answers `503 database-unavailable` when `pg_notify` never returned (immediately when the database refused it) and `504` otherwise. The deadlines compare wall clocks: across pods they rely on NTP. Within the deadline a replayed message — or the statement the pool re-sends after a lost connection — is stopped by its id.
@@ -334,6 +336,8 @@ Section `module.GatewayAPI` of the application's JSON configuration:
 | `allowed_cidr` | `[]` | IPv4 networks `a.b.c.d/n` an instance may register an `address` in; an empty list refuses every registration with `403` |
 | `audience` | `service` | the OAuth2 provider (section of `oauth2/*.json`) whose tokens open the control plane |
 
+The worker's identity is not a key of this section: it is the application's `node` (top level of the configuration, e.g. `"node": "${NODE_NAME}"`), else `$NODE_NAME`, else the host name (*Mirror*, **Identity**). Two gateway processes on one database must not share a node name unless they share a PID namespace too. In Kubernetes set `NODE_NAME` from `metadata.name` (the pod), **not** `spec.nodeName` (the machine: two pods on one machine would share it); in docker the container's host name is unique — except with `network_mode: host`, an explicit `hostname:`, or `hostNetwork: true` in Kubernetes, where it is the machine's or a shared one: set `node` explicitly there.
+
 Installation
 -
 
@@ -365,7 +369,7 @@ app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, c
 
 **OAuth2 audience.** The control plane is opened by `client_credentials` tokens of the provider named in `audience` — by default the `service` provider of `oauth2/*.json`, which every Apostol deployment has (client_id `service-${DOMAIN}`, secret from `CLIENT_SECRET_SERVICE`); modules obtain their token from `POST /oauth2/token` with that client. A dedicated provider is possible (`audience` names it; the matching audience must exist in the database — `AddApplication` + `CreateAudience` of db-platform), but not required. At start the module logs an error if the provider is missing or its secret is empty — every module would be refused with nothing but close reasons to show for it.
 
-**Database.** Schema `gateway` from db-platform (module `gateway`, in `create.psql` / `update.psql`, or its patch on an existing database). The worker pool role needs `SELECT, INSERT, UPDATE, DELETE` on `gateway.node` and `INSERT` on `gateway.log` — granted by the module's `table.sql`.
+**Database.** Schema `gateway` from db-platform (module `gateway`, in `create.psql` / `update.psql`, or its patch on an existing database) **with the `node` column** (patch `P00000031`): this version writes it in every statement, and without it every mirror write fails — apply the schema first, then roll the binary; a gateway that predates the column works on the new schema, but not **next to** this version: it leaves `node` as it was on a row it takes over, and between PID namespaces the resulting pair can match a worker of this version — the old flapping again. Roll every gateway of one database at once (or shrink to one first). The worker pool role needs `SELECT, INSERT, UPDATE, DELETE` on `gateway.node` and `INSERT` on `gateway.log` — granted by the module's `table.sql`.
 
 Self-test
 -
@@ -380,6 +384,6 @@ python3 tests/stub_client.py … --peer http://127.0.0.1:4978 \
     --pg "host=127.0.0.1 port=5432 dbname=example user=daemon" --pg-password-file /path/to/pgpass
 ```
 
-The stub expects `heartbeat_interval` 2, `reload_interval` 5, `response_timeout_ms` 2000 and `127.0.0.0/8` in `allowed_cidr` of the gateways it runs against (see its header). Scenarios: registration and its refusals, handshake refusals, the clock (`suspect` / `offline`), commands, replacement, frames, routing, the data plane with an echo module, the mirror with a second worker, a fresh worker after `SIGHUP`, a lost `LISTEN`, a prefix handoff seen only by a re-read, commands relayed through the second worker — forged, replayed and late ones included (`--pg-container` pauses the database's container for the late one). Number 11 is reserved.
+The stub expects `heartbeat_interval` 2, `reload_interval` 5, `response_timeout_ms` 2000 and `127.0.0.0/8` in `allowed_cidr` of the gateways it runs against (see its header). Scenarios: registration and its refusals, handshake refusals, the clock (`suspect` / `offline`), commands, replacement, frames, routing, the data plane with an echo module, the mirror with a second worker, a fresh worker after `SIGHUP`, a lost `LISTEN`, a prefix handoff seen only by a re-read, commands relayed through the second worker — forged, replayed and late ones included (`--pg-container` pauses the database's container for the late one). Number 11 — two workers under one pid — needs the two gateways in PID namespaces of their own (a container each, the network shared) and is skipped otherwise: with different node names an instance stays `ready` over three re-reads with no `no socket on worker`; with one node name, or on a gateway that tells workers apart by pid alone, the other worker closes the live row every re-read.
 
 [^crm]: **Apostol CRM** — a template project built on the [A-POST-OL](https://github.com/apostoldevel/libapostol) (C++20) and [PostgreSQL Framework for Backend Development](https://github.com/apostoldevel/db-platform) frameworks.

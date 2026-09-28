@@ -23,7 +23,13 @@ spawns new workers and retires the old ones, and every request through the peer 
 503 + `Retry-After` — a fresh worker knows only its own sockets until its first reload, and a miss
 then is not yet a 404. Scenario 13 (`--pg`) kills the listening connections and commits a row in
 the same transaction: its NOTIFY is lost, and the row must appear on the reload the gateway runs
-when LISTEN is confirmed again, well before `reload_interval`. Scenario 11 is reserved for two processes with one identity (T592, 3е).
+when LISTEN is confirmed again, well before `reload_interval`.
+Scenario 11 (`--peer`, `--pg`) needs the two gateways to run under ONE pid — each in a PID namespace of
+its own (a container each: `run11.sh` next to the stand's `run.sh`), with the network shared. With
+different `NODE_NAME`s an instance registered on one of them must stay `ready` over three reloads, with
+no `no socket on worker` in `gateway.log`; with the same `NODE_NAME` — or on a binary that identifies
+a worker by its pid alone — the other one closes the live row every reload (the negative control).
+With different pids it is skipped: nothing to collide.
 Scenario 15 (`--peer`, `--pg`) sends commands through the peer to an instance whose socket this gateway holds:
 they are relayed over NOTIFY `gateway_cmd`, signed with a key of the audience secret; forged, replayed and late
 messages must not reach the module. With `--pg-container` it pauses the database's docker container for about ten
@@ -39,6 +45,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -48,6 +55,7 @@ import uuid
 # which is easy to mistake for a gateway failure.
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
 
+import collections  # noqa: E402
 import requests  # noqa: E402
 import websockets  # noqa: E402
 
@@ -549,7 +557,9 @@ async def scenario_data_plane(gw, tok):
                           headers={"Authorization": f"Bearer {tok}", "X-Forwarded-For": "1.2.3.4, 203.0.113.7 ,  198.51.100.9 "}, timeout=5)
         check(hdr(chain.json(), "X-Forwarded-For") == ["198.51.100.9"], f"X-Forwarded-For from a chain — last element, no spaces ({hdr(chain.json(), 'X-Forwarded-For')})")
         check(hdr(seen, "X-Forwarded-Proto") == ["https"], "X-Forwarded-Proto: https")
-        check(hdr(seen, "X-Gateway-Worker") and hdr(seen, "X-Gateway-Worker")[0].isdigit(), "X-Gateway-Worker: pid")
+        gw_worker = hdr(seen, "X-Gateway-Worker")
+        check(len(gw_worker) == 1 and re.fullmatch(r"\S+:\d+", gw_worker[0]) is not None,
+              f"X-Gateway-Worker: <node>:<pid> ({gw_worker})")
         check(hdr(seen, "User-Agent") == ["stub/9"] and hdr(seen, "Content-Type") == ["application/json"], "User-Agent, Content-Type as is")
         check(len(hdr(seen, "Connection")) == 1 and hdr(seen, "Connection")[0].lower() == "close", "Connection: close exactly one")
         check(len(hdr(seen, "Host")) == 1, f"Host exactly one ({hdr(seen, 'Host')})")
@@ -625,7 +635,7 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         return c.fetchall() if c.description else None
 
     def row(module, instance):
-        r = q("SELECT state, worker, address, extract(epoch FROM now() - seen)::int FROM gateway.node WHERE module = %s AND instance = %s", module, instance)
+        r = q("SELECT state, worker, address, extract(epoch FROM now() - seen)::int, node FROM gateway.node WHERE module = %s AND instance = %s", module, instance)
         return r[0] if r else None
 
     def journal(module, instance, since_id):
@@ -650,9 +660,12 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         return cond()
 
     hdrs = {"Authorization": f"Bearer {tok}"}
-    me = requests.get(f"{gw}/gateway/list", headers=hdrs, timeout=5).json()["gateway_worker"]
-    other = requests.get(f"{peer}/gateway/list", headers=hdrs, timeout=5).json()["gateway_worker"]
-    check(me != other, f"two gateways — two workers ({me}, {other})")
+    my_list = requests.get(f"{gw}/gateway/list", headers=hdrs, timeout=5).json()
+    other_list = requests.get(f"{peer}/gateway/list", headers=hdrs, timeout=5).json()
+    me, other = my_list["gateway_worker"], other_list["gateway_worker"]
+    me_id, other_id = my_list["gateway_node"], other_list["gateway_node"]   # "<node>:<pid>"
+    my_node = me_id.rsplit(":", 1)[0]
+    check(me != other and me_id == f"{my_node}:{me}", f"two gateways — two workers ({me_id}, {other_id})")
     # Clean slate: foreign rows from past runs — offline, so they don't interfere with 409 on prefix.
     q("UPDATE gateway.node SET state = 'offline' WHERE state <> 'offline' AND coalesce(worker, 0) NOT IN (%s, %s)", me, other)
 
@@ -664,7 +677,8 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         ws = await connect(gw, tok, "mirror", "m1")
         check((await register(ws, "mirror", "m1", address="127.0.0.1:18110"))["t"] == 3, "mirror/m1 registered on my side")
         check(await settle(lambda: (row("mirror", "m1") or (None,))[0] == "ready", 3, "row"), f"gateway.node: ready, worker={me} ({row('mirror', 'm1')})")
-        check(row("mirror", "m1")[1] == me, "gateway.node.worker — my pid")
+        check(row("mirror", "m1")[1] == me and row("mirror", "m1")[4] == my_node,
+              f"gateway.node.worker — my pid, gateway.node.node — my node ({row('mirror', 'm1')[4]!r})")
         j = journal("mirror", "m1", l0)
         check(j and j[-1][1] == "ready" and j[-1][2] == "registered", f"gateway.log: → ready, reason=registered ({j})")
         check(await settle(lambda: listing(peer, tok).get(("mirror", "m1"), {}).get("state") == "ready", 3, "peer"), "peer: ready via NOTIFY")
@@ -675,7 +689,7 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         check(r.status_code == 200 and r.json()["instance"] == "m1", "peer: /gateway/route → m1")
         r = await asyncio.to_thread(requests.get, f"{peer}/api/v2/mirror/ping", headers=hdrs, timeout=5)
         check(r.status_code == 200 and r.json()["target"] == "/api/v2/mirror/ping", "data plane THROUGH THE PEER reaches the module registered on my side")
-        check(hdr(echo.seen[-1], "X-Gateway-Worker") == [str(other)], f"X-Gateway-Worker — peer's pid ({hdr(echo.seen[-1], 'X-Gateway-Worker')})")
+        check(hdr(echo.seen[-1], "X-Gateway-Worker") == [other_id], f"X-Gateway-Worker — the peer's identity ({hdr(echo.seen[-1], 'X-Gateway-Worker')})")
         # A command to the peer is relayed to my worker over gateway_cmd (scenario 15 has the details).
         fut = asyncio.ensure_future(asyncio.to_thread(requests.post, f"{peer}/gateway/mirror/m1/ping",
                                                       headers=hdrs, timeout=10))
@@ -728,6 +742,7 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         code, reason = await close_code(ws_a, timeout=4)
         check(code == 1001 and reason == "replaced", f"my socket closed 1001 replaced ({code} {reason!r})")
         check(await settle(lambda: row("mirror", "m2")[1] == other and row("mirror", "m2")[0] == "ready", 3, "m2 other"), f"gateway.node: m2 ready on the peer ({row('mirror', 'm2')})")
+        check(row("mirror", "m2")[4] == other_id.rsplit(":", 1)[0], "gateway.node.node — the peer's node, set on the ON CONFLICT branch too")
         j = journal("mirror", "m2", l3)
         check(j == [("ready", "offline", "re-registered"), ("offline", "ready", "registered")], f"gateway.log: ready→offline re-registered, offline→ready registered ({j})")
         mine = listing(gw, tok)[("mirror", "m2")]
@@ -771,14 +786,27 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         j = journal("mirror", "m3", l5)
         check(j == [("ready", "offline", "foreign sweep"), ("offline", "ready", "owner re-asserted")], f"gateway.log: … offline→ready owner re-asserted ({j})")
 
-        # 8. A row with MY pid but no socket (a previous life of the pid) → offline on reload
+        # 8. A row with MY identity (node and pid) but no socket (a previous life of it) → offline on
+        #    reload. A row with my pid and NO node (a binary that writes none) is not mine: mirrored,
+        #    never closed as "no socket on worker" — the same reload is the canary that it was read.
         l6 = last_log_id()
-        q("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
-          " VALUES ('mirror', 'ghost', '0', '127.0.0.1:18198', ARRAY['/api/v2/mirror-ghost'], 'ready', 1, %s)"
-          " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = EXCLUDED.worker, seen = now()", me)
-        check(await settle(lambda: row("mirror", "ghost")[0] == "offline", RELOAD + 2, "ghost", hb=ws3), "row with my pid but no socket → offline on reload")
+        q("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker, node)"
+          " VALUES ('mirror', 'ghost', '0', '127.0.0.1:18198', ARRAY['/api/v2/mirror-ghost'], 'ready', 1, %s, %s)"
+          " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = EXCLUDED.worker, node = EXCLUDED.node, seen = now()",
+          me, my_node)
+        q("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker, node)"
+          " VALUES ('mirror', 'ghost-null', '0', '127.0.0.1:18191', ARRAY['/api/v2/mirror-ghostnull'], 'ready', 1, %s, NULL)"
+          " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = EXCLUDED.worker, node = NULL, seen = now()", me)
+        check(await settle(lambda: row("mirror", "ghost")[0] == "offline", RELOAD + 2, "ghost", hb=ws3), "row with my node and pid but no socket → offline on reload")
         j = journal("mirror", "ghost", l6)
         check(j and j[-1] == ("ready", "offline", "no socket on worker"), f"gateway.log: reason=no socket on worker ({j})")
+        j = journal("mirror", "ghost-null", l6)
+        check(row("mirror", "ghost-null")[0] == "ready" and not any(c == "no socket on worker" for _, _, c in j),
+              f"row with my pid and node NULL — not mine: left ready by the same reload ({row('mirror', 'ghost-null')[0]}, {j})")
+        gn = listing(gw, tok).get(("mirror", "ghost-null"), {})
+        check(gn.get("source") == "mirror" and gn.get("state") == "ready" and gn.get("owner_node") is None and gn.get("owner_worker") == me,
+              f"…mirrored on my side, owner_node null ({gn.get('source')}, {gn.get('state')}, {gn.get('owner_node')!r})")
+        q("UPDATE gateway.node SET state = 'offline' WHERE module = 'mirror' AND instance = 'ghost-null'")
 
         # 9. Rows that did not come through /register get its checks (address inside allowed_cidr,
         #    valid prefixes): pg_notify is open to any role with CONNECT. A refused row changes
@@ -805,6 +833,18 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         check(mine["source"] == "socket" and mine["address"] == "127.0.0.1:18110", "mine: forged ready with a foreign pid is no takeover — socket kept")
         await ws3.send(call("/heartbeat", {"in_flight": 0}))
         check((await rx(ws3))["t"] == 3, "m3 socket alive after the forged NOTIFY")
+
+        # the same forgery with the REAL address and prefix — every check of the payload passes. The
+        # NOTIFY is only a signal: the row, read back, is still mine, so the socket stays.
+        notify(instance="m3", address="127.0.0.1:18110", prefixes=["/api/v2/mirror3"], worker=424243, node="forged-node")
+        await asyncio.sleep(HB / 2 + 0.3)   # the re-read lands; and the heartbeat below is not a 429 (< HB/2 since the last)
+        mine = listing(gw, tok)[("mirror", "m3")]
+        check(mine["source"] == "socket" and mine["owner_worker"] == me,
+              f"mine: forged ready with the real address and another identity — no takeover, socket kept ({mine['source']}, {mine['owner_worker']})")
+        await ws3.send(call("/heartbeat", {"in_flight": 0}))
+        check((await rx(ws3))["t"] == 3, "m3 socket alive after the forged NOTIFY with the real address")
+        # the peer's mirror of m3 may have taken the forged owner from the payload: routing is the same
+        # address, and the peer's reload corrects the owner from the row
 
         # a prefix under another module's live prefix, from an address that IS allowed: the longest
         # prefix would win, so this is a hijack of /api/v2/mirror3/x/* — refused like a 409 at /register
@@ -865,9 +905,82 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         pg.close()
 
 
-async def scenario_same_identity(gw, tok):
-    print("11. two processes with one identity (stage 3е, after the node column) — not written yet")
-    print("  [skip] needs gateway.node.node (T592 stage 1)")
+async def scenario_same_identity(gw, tok, peer, pg_dsn):
+    print("11. one pid in two processes (PID namespaces): a worker is (node, pid) — with different nodes, three reloads without 'no socket on worker'")
+    if not peer or not pg_dsn:
+        print("  [skip] needs --peer and --pg")
+        return
+    hdrs = {"Authorization": f"Bearer {tok}"}
+    a = requests.get(f"{gw}/gateway/list", headers=hdrs, timeout=5).json()
+    b = requests.get(f"{peer}/gateway/list", headers=hdrs, timeout=5).json()
+    # gateway_node is absent on a binary that identifies a worker by its pid alone
+    print(f"  gateways: pid {a['gateway_worker']} node {a.get('gateway_node')} / pid {b['gateway_worker']} node {b.get('gateway_node')}")
+    if a["gateway_worker"] != b["gateway_worker"]:
+        print("  [skip] the gateways run under different pids — nothing collides (run them in PID namespaces of their own: run11.sh)")
+        return
+    check(True, f"precondition: both gateways run as pid {a['gateway_worker']}")
+    import psycopg2
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+
+    def q(sql, *args):
+        c = pg.cursor()
+        c.execute(sql, args)
+        return c.fetchall() if c.description else None
+
+    def state():
+        r = q("SELECT state FROM gateway.node WHERE module = 'twin' AND instance = 't1'")
+        return r[0][0] if r else None
+
+    ws = None
+    try:
+        q("UPDATE gateway.node SET state = 'offline' WHERE module = 'twin'")
+        ws = await connect(gw, tok, "twin", "t1")
+        check((await register(ws, "twin", "t1", address="127.0.0.1:18111", prefixes=["/api/v2/twin"]))["t"] == 3, "twin/t1 registered on the first gateway")
+        t0 = time.time()
+        while time.time() - t0 < 3 and not (state() == "ready" and listing(peer, tok).get(("twin", "t1"), {}).get("state") == "ready"):
+            await asyncio.sleep(0.1)
+        check(state() == "ready", "gateway.node: twin/t1 ready")
+        check(listing(peer, tok).get(("twin", "t1"), {}).get("state") == "ready", "the second gateway mirrors it ready")
+        since = q("SELECT coalesce(max(id), 0) FROM gateway.log")[0][0]
+
+        window = 3 * RELOAD + 2     # three reloads of each gateway, and a tick
+        samples, row_off, peer_off = 0, collections.Counter(), collections.Counter()
+        next_hb = time.time() + HB
+        end = time.time() + window
+        while time.time() < end:
+            if time.time() >= next_hb:
+                await ws.send(call("/heartbeat", {"in_flight": 0}))
+                await rx(ws)
+                next_hb = time.time() + HB
+            samples += 1
+            st = state()
+            if st != "ready":
+                row_off[st] += 1
+            ps = listing(peer, tok).get(("twin", "t1"), {}).get("state")
+            if ps != "ready":
+                peer_off[ps] += 1
+            await asyncio.sleep(0.2)
+        j = q("SELECT state_from, state_to, reason, worker, node FROM gateway.log"
+              " WHERE module = 'twin' AND instance = 't1' AND id > %s ORDER BY id", since)
+        nosock = sum(1 for r in j if r[2] == "no socket on worker")
+        print(f"  {window} s, {samples} samples: gateway.node not ready {dict(row_off)}; the second gateway not ready {dict(peer_off)}")
+        print(f"  gateway.log of twin/t1 in the window: {len(j)} transitions, {nosock} 'no socket on worker'")
+        for r in j[:6]:
+            print(f"    {r}")
+        check(nosock == 0, f"no 'no socket on worker' over three reloads ({nosock})")
+        check(not j, f"no transition of twin/t1 while it heartbeats ({len(j)})")
+        check(not row_off and not peer_off, "ready at every sample, in the database and on the second gateway")
+    finally:
+        if ws is not None:
+            try:
+                await ws.send(call("/unregister", {"reason": "done"}))
+                await rx(ws)
+                await close_code(ws)
+            except Exception:
+                pass
+        q("UPDATE gateway.node SET state = 'offline' WHERE module = 'twin'")
+        pg.close()
 
 
 async def scenario_fresh_worker(gw, tok, peer, peer_master):
@@ -1228,7 +1341,7 @@ async def scenario_commands_relayed(gw, tok, peer, pg_dsn, pg_container):
             got = await calls(1.5)
             check(got == [], f"forged gateway_cmd ({what}) → no CALL reached the module")
         captured()
-        notify(cmd_signed({"k": "cmd", "id": str(uuid.uuid4()), "from": 1, "module": "relay", "instance": "x1",
+        notify(cmd_signed({"k": "cmd", "id": str(uuid.uuid4()), "from": "stub:1", "module": "relay", "instance": "x1",
                            "command": "ping", "p": {}, "deadline": int(time.time() * 1000) + 2000}))
         got = await calls(1.5)
         check(got == ["/ping"], "positive control: the same command signed with the audience key → the CALL arrives")
@@ -1311,7 +1424,7 @@ async def main():
                  scenario_commands, scenario_replace, scenario_frames, scenario_route,
                  scenario_data_plane,
                  lambda gw, tok: scenario_mirror(gw, tok, args.peer, args.pg),
-                 scenario_same_identity,
+                 lambda gw, tok: scenario_same_identity(gw, tok, args.peer, args.pg),
                  lambda gw, tok: scenario_fresh_worker(gw, tok, args.peer, args.peer_master_pid),
                  lambda gw, tok: scenario_listen_lost(gw, tok, args.pg),
                  lambda gw, tok: scenario_prefix_handoff(gw, tok, args.pg),

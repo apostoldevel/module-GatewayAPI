@@ -111,6 +111,10 @@ public:
         int         conn_errors{0};   // consecutive connect failures (passive check)
         std::chrono::system_clock::time_point registered;
         std::chrono::system_clock::time_point last_heartbeat;
+        // Who holds the socket: the pair (node, pid) of that worker (README
+        // § Identity). owner_node empty — the row's `node` is NULL, written by
+        // a binary that does not know the column: never this worker's.
+        std::string owner_node;
         int         owner_worker{0};
         Source      source{Source::socket};
         // mirror_seq_ of this worker's last write of the row — any (upsert or
@@ -277,7 +281,7 @@ private:
                     std::function<void(std::string_view)> on_fail);
     /// The holder's side: the module's answer to a relayed command, back to
     /// the worker that relayed it.
-    void cmd_answer(const std::string& id, int to, const Answer& a);
+    void cmd_answer(const std::string& id, const std::string& to, const Answer& a);
     void on_cmd_notify(std::string_view payload);
     void on_cmd_notify_(std::string_view payload);
     /// The HMAC key of the channel, derived from the audience secret; empty —
@@ -294,7 +298,15 @@ private:
     std::shared_ptr<Node> socket_of(const std::string& module, const std::string& instance) const;
     /// True when this worker writes the row: it holds the socket.
     bool owns(const Instance& inst) const
-    { return inst.source == Source::socket && inst.owner_worker == pid_; }
+    { return inst.source == Source::socket && inst.owner_worker == pid_ && inst.owner_node == node_; }
+    /// True when a row (a NOTIFY payload, a row read back) names THIS worker:
+    /// its `node` equals node_ AND its `worker` equals pid_. A NULL or absent
+    /// `node` — a row of a binary that does not write it — is never ours,
+    /// whatever its pid (README § Identity).
+    bool row_is_me(const nlohmann::json& row) const;
+    /// "<node>:<pid>" of a row, for the log and the takeover; "(null):<pid>"
+    /// for a row without `node`.
+    static std::string row_identity(const nlohmann::json& row);
 
     /// Route resolution + instance choice (README § Routing table). Longest
     /// prefix among instances in `ready` that carry it; among those the least
@@ -351,7 +363,8 @@ private:
     /// and `registered` is kept: a re-assert is not a registration.
     void mirror_upsert(const Instance& inst, std::string_view pre_reason, std::string_view reason,
                        bool reassert = false);
-    /// UPDATE state (+ worker) with @p reason in the gateway.reason GUC.
+    /// UPDATE state with @p reason in the gateway.reason GUC — of the row
+    /// only while it still names this worker (node, pid).
     void mirror_state(const Instance& inst, std::string_view reason);
     /// `seen = now()` for the own instances that heartbeated within the last
     /// interval — one statement per worker per interval.
@@ -377,10 +390,18 @@ private:
     bool mirror_admissible(const nlohmann::json& row, std::string_view why);
     void mirror_refused(const nlohmann::json& row, std::string_view why, std::string_view reason);
     /// NOTIFY `gateway` — the trigger's payload {op, module, instance, state,
-    /// state_from, address, prefixes, worker}. Own writes come back too.
+    /// state_from, address, prefixes, worker, node, updated}. Own writes come
+    /// back too. `updated` is now() of the writing transaction — not a version,
+    /// never ordered by, never parsed.
     void on_gateway_notify(std::string_view payload);
     void on_gateway_notify_(std::string_view payload);
-    void take_over(const std::string& module, const std::string& instance, int by_worker);
+    /// A NOTIFY that would take over a live socket of this worker is a signal,
+    /// not an order: the row is read back from gateway.node (writable by the
+    /// gateway roles only, where pg_notify is open to any role with CONNECT)
+    /// and the takeover acts on the row. Queued in the mirror FIFO behind this
+    /// worker's own writes; one outstanding re-read per instance.
+    void mirror_reread(const std::string& module, const std::string& instance);
+    void take_over(const std::string& module, const std::string& instance, std::string_view by);
     static std::string sql_prefixes(const std::vector<std::string>& prefixes);
     static std::string sql_ident(std::string_view module, std::string_view instance);
     void mirror_warn(std::string_view what, std::string_view error);
@@ -436,7 +457,13 @@ private:
     std::map<std::string, std::map<std::string, Instance>> table_;  // module → instance
     unsigned rr_{0};   // round-robin cursor for pick_instance ties
     std::map<std::string, Upstream> upstreams_;   // by "host:port"
-    int pid_{0};
+    // Identity of this worker (README § Identity): node_ — Application::node_id()
+    // ("node" of the configuration, else $NODE_NAME, else the host name), pid_
+    // — its pid; self_ — "<node>:<pid>", Application::node_process_id(). A pid
+    // alone repeats between pods and containers on one database.
+    std::string node_;
+    int         pid_{0};
+    std::string self_;
 
     // mirror
     bool listen_armed_{false};
