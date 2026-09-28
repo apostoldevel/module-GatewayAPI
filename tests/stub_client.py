@@ -985,6 +985,94 @@ async def scenario_listen_lost(gw, tok, pg_dsn):
         pg.close()
 
 
+async def scenario_prefix_handoff(gw, tok, pg_dsn):
+    print("14. prefix handoff: a reload admits the new owner of a prefix whose old owner the same snapshot shows gone")
+    if not pg_dsn:
+        print("  [skip] needs --pg")
+        return
+    import psycopg2
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+    prefix = "/api/v2/handoff"
+    upsert = ("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
+              " VALUES (%s, %s, '0', %s, ARRAY[%s], 'ready', 1, NULL)"
+              " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = NULL, seen = now(),"
+              " address = EXCLUDED.address, prefixes = EXCLUDED.prefixes")
+    try:
+        # The old owner, announced normally: every worker mirrors it.
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module IN ('hoa', 'hob', 'hoc', 'hod', 'hoe')")
+        pg.cursor().execute(upsert, ("hob", "b1", "127.0.0.1:18190", prefix))
+        t0 = time.time()
+        while time.time() - t0 < RELOAD and listing(gw, tok).get(("hob", "b1"), {}).get("state") != "ready":
+            await asyncio.sleep(0.05)
+        check(listing(gw, tok).get(("hob", "b1"), {}).get("state") == "ready", "old owner hob/b1 mirrored")
+
+        # The handoff with both NOTIFYs lost: old owner offline, new owner ready — seen only by a reload.
+        c = pg.cursor()
+        c.execute("BEGIN")
+        try:
+            c.execute("SET LOCAL session_replication_role = replica")
+        except psycopg2.Error:
+            c.execute("ROLLBACK")
+            print("  [skip] needs a role that may set session_replication_role")
+            return
+        c.execute("UPDATE gateway.node SET state = 'offline' WHERE module = 'hob'")
+        c.execute(upsert, ("hoa", "a1", "127.0.0.1:18191", prefix))
+        c.execute("COMMIT")
+        # A reload now: re-LISTEN re-reads at once (3b), no waiting for reload_interval.
+        c.execute("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity"
+                  " WHERE datname = current_database() AND query ILIKE 'LISTEN%%' AND pid <> pg_backend_pid()")
+        killed = c.fetchone()[0]
+        check(killed >= 1, f"listeners killed ({killed}) — a reload follows")
+        t0 = time.time()
+        while time.time() - t0 < RELOAD and listing(gw, tok).get(("hoa", "a1"), {}).get("state") != "ready":
+            await asyncio.sleep(0.05)
+        took = time.time() - t0
+        rows = listing(gw, tok)
+        check(rows.get(("hoa", "a1"), {}).get("state") == "ready" and took < RELOAD / 2,
+              f"new owner hoa/a1 ready after {took:.2f} s (< {RELOAD / 2} s) — not refused against the stale hob/b1")
+        check(rows.get(("hob", "b1"), {}).get("state") == "offline", "old owner hob/b1 offline")
+
+        async def silent_then_reload(rows_, canary):
+            # rows_ written with no NOTIFY, plus a canary row only a reload can bring; returns once
+            # the canary is mirrored — i.e. a reload has run over this snapshot.
+            c.execute("BEGIN")
+            c.execute("SET LOCAL session_replication_role = replica")
+            for r in rows_:
+                c.execute(upsert, r)
+            c.execute(upsert, ("hod", canary, "127.0.0.1:18199", f"/api/v2/{canary}"))
+            c.execute("COMMIT")
+            c.execute("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity"
+                      " WHERE datname = current_database() AND query ILIKE 'LISTEN%%' AND pid <> pg_backend_pid()")
+            n = c.fetchone()[0]
+            check(n >= 1, f"listeners killed ({n}) — a reload follows")
+            t = time.time()
+            while time.time() - t < RELOAD and listing(gw, tok).get(("hod", canary), {}).get("state") != "ready":
+                await asyncio.sleep(0.05)
+            took_ = time.time() - t
+            check(listing(gw, tok).get(("hod", canary), {}).get("state") == "ready" and took_ < RELOAD / 2,
+                  f"canary hod/{canary} mirrored after {took_:.2f} s — the reload ran")
+            return listing(gw, tok)
+
+        # The other way round: a newcomer under the prefix of an established owner. The newcomer is
+        # refused; the established owner must not be refused against it.
+        rows = await silent_then_reload([("hoc", "c1", "127.0.0.1:18192", prefix + "/x")], "d1")
+        check(rows.get(("hoc", "c1"), {}).get("state") != "ready", "newcomer hoc/c1 under hoa's prefix — refused")
+        check(rows.get(("hoa", "a1"), {}).get("state") == "ready", "established hoa/a1 stays ready")
+
+        # An established owner moves to another prefix and a newcomer takes its old one, both in one
+        # snapshot: the old prefix is no longer held — the newcomer is admitted by this very reload.
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module = 'hoc'")
+        rows = await silent_then_reload([("hoa", "a1", "127.0.0.1:18191", prefix + "2"),
+                                          ("hoe", "e1", "127.0.0.1:18193", prefix)], "d2")
+        check(rows.get(("hoe", "e1"), {}).get("state") == "ready",
+              "newcomer hoe/e1 on the prefix hoa/a1 just left — admitted by the same reload")
+        check(rows.get(("hoa", "a1"), {}).get("state") == "ready", "hoa/a1 ready on its new prefix")
+    finally:
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module IN ('hoa', 'hob', 'hoc', 'hod', 'hoe')")
+        pg.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -1014,7 +1102,8 @@ async def main():
                  lambda gw, tok: scenario_mirror(gw, tok, args.peer, args.pg),
                  scenario_same_identity,
                  lambda gw, tok: scenario_fresh_worker(gw, tok, args.peer, args.peer_master_pid),
-                 lambda gw, tok: scenario_listen_lost(gw, tok, args.pg)]
+                 lambda gw, tok: scenario_listen_lost(gw, tok, args.pg),
+                 lambda gw, tok: scenario_prefix_handoff(gw, tok, args.pg)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):

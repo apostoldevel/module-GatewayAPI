@@ -316,7 +316,9 @@ private:
     /// a NOTIFY (any role with CONNECT can issue one) or a row read back:
     /// names, `address` an IPv4 literal inside allowed_cidr, `prefixes` a
     /// non-empty array of valid prefixes overlapping neither each other nor a
-    /// live instance of another module. Empty — admissible; else the reason.
+    /// live instance of another module — in a reload, of the snapshot being
+    /// applied (reload_claims_), not of the table it replaces. Empty —
+    /// admissible; else the reason.
     std::string mirror_refusal(const nlohmann::json& row) const;
     /// mirror_refusal() that logs a refusal, throttled.
     bool mirror_admissible(const nlohmann::json& row, std::string_view why);
@@ -379,6 +381,11 @@ private:
     std::chrono::system_clock::time_point mirror_warned_{};
     std::chrono::system_clock::time_point refused_warned_{};   // mirror_refused: once per reload_interval
     int                                   refused_quiet_{0};    // refusals not logged since
+    // Set for the length of a reload's reconcile loop: module -> the prefixes
+    // its live rows in the snapshot and this worker's own sockets claim. The
+    // cross-module check of mirror_refusal runs against it instead of table_,
+    // which still holds instances the same snapshot shows gone.
+    const std::map<std::string, std::vector<std::string>>* reload_claims_{nullptr};
     struct MirrorWrite { std::string sql; std::string what; PgQuery::ResultHandler on_result; std::string kind;
                          std::function<void()> on_fail; };
     std::deque<MirrorWrite> mirror_queue_;

@@ -1656,6 +1656,45 @@ void GatewayAPI::mirror_reload()
 
         const auto now = clock_t_::now();
         std::map<std::string, std::map<std::string, bool>> seen;   // (module, instance) present in the database
+
+        // Who holds which prefix, as of this snapshot: an instance live in the
+        // table AND in the snapshot holds the prefixes it has in both
+        // (established — a newcomer overlapping one is refused, not the other
+        // way round); this worker's own sockets hold theirs (the truth,
+        // whatever the snapshot says). An instance the snapshot shows gone, or
+        // a prefix its row no longer carries, holds nothing any more: it may
+        // have been handed over. A prefix a row added, and every foreign row
+        // admitted below, is claimed in loop order, so of two overlapping
+        // newcomers only the first is taken. mirror_refusal checks
+        // cross-module overlap against this for the length of the loop.
+        std::map<std::string, std::vector<std::string>> claims;
+        for (const auto& row : rows) {
+            if (!row.is_object() || !row.contains("module") || !row["module"].is_string() ||
+                !row.contains("instance") || !row["instance"].is_string()) continue;
+            const auto module = row["module"].get<std::string>();
+            const auto* known = find_instance(module, row["instance"].get<std::string>());
+            if (!known || known->state == "offline" || !row.contains("prefixes") || !row["prefixes"].is_array())
+                continue;
+            for (const auto& p : known->prefixes)
+                if (std::find(row["prefixes"].begin(), row["prefixes"].end(), p) != row["prefixes"].end())
+                    claims[module].push_back(p);
+        }
+        for (const auto& [mod, insts] : table_)
+            for (const auto& [name, inst] : insts)
+                if (owns(inst) && socket_of(mod, name))
+                    claims[mod].insert(claims[mod].end(), inst.prefixes.begin(), inst.prefixes.end());
+        // mirror_apply also returns true for a refused row that only takes a
+        // state: that one claims nothing.
+        const auto claim = [this, &claims](const json& row) {
+            if (!mirror_refusal(row).empty()) return;
+            auto& to = claims[row["module"].get<std::string>()];
+            for (const auto& p : row["prefixes"]) to.push_back(p.get<std::string>());
+        };
+        struct ClaimsScope {
+            const std::map<std::string, std::vector<std::string>>*& slot;
+            ~ClaimsScope() { slot = nullptr; }
+        } claims_scope{reload_claims_};
+        reload_claims_ = &claims;
         for (const auto& row : rows) {
             if (!row.is_object() || !row.contains("module") || !row.contains("instance")) continue;
             const std::string module = row["module"].get<std::string>();
@@ -1677,6 +1716,7 @@ void GatewayAPI::mirror_reload()
                     if (mirror_admissible(row, "reload")) {
                         take_over(module, instance, worker);
                         mirror_apply(row, "reload");
+                        claim(row);
                     }
                 } else {
                     const bool same_route = row.value("address", "") == mine->address &&
@@ -1707,7 +1747,8 @@ void GatewayAPI::mirror_reload()
             }
             // A row the database holds but this worker refuses to route to
             // counts as absent: a mirror of it goes offline below.
-            if (!mirror_apply(row, "reload")) seen[module].erase(instance);
+            if (mirror_apply(row, "reload")) claim(row);
+            else seen[module].erase(instance);
         }
 
         for (auto& [mod, insts] : table_)
@@ -1772,14 +1813,30 @@ std::string GatewayAPI::mirror_refusal(const json& row) const
             if (prefixes_overlap(have, s)) return fmt::format("prefixes overlap: {} and {}", have, s);
         prefixes.push_back(s);
     }
+    const auto taken = [&](const std::string& mod, const std::vector<std::string>& theirs) -> std::string {
+        for (const auto& t : theirs)
+            for (const auto& mine : prefixes)
+                if (prefixes_overlap(t, mine))
+                    return fmt::format("prefix {} belongs to module {}", mine, mod);
+        return {};
+    };
+    if (reload_claims_) {
+        // A reload: the snapshot is the truth about who else is live. The
+        // table may still hold an instance the snapshot shows offline or
+        // gone (its NOTIFY lost) — checked against it, the new owner of a
+        // handed-over prefix would be refused and the path left on the old
+        // one for a whole reload_interval.
+        for (const auto& [mod, theirs] : *reload_claims_) {
+            if (mod == module) continue;
+            if (auto why = taken(mod, theirs); !why.empty()) return why;
+        }
+        return {};
+    }
     for (const auto& [mod, insts] : table_) {
         if (mod == module) continue;
         for (const auto& [name, inst] : insts) {
             if (inst.state == "offline") continue;
-            for (const auto& theirs : inst.prefixes)
-                for (const auto& mine : prefixes)
-                    if (prefixes_overlap(theirs, mine))
-                        return fmt::format("prefix {} belongs to module {}", mine, mod);
+            if (auto why = taken(mod, inst.prefixes); !why.empty()) return why;
         }
     }
     return {};
