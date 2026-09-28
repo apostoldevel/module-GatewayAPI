@@ -141,7 +141,7 @@ These are issued through the management endpoints below.
 
 | `c` | When | Socket |
 |-----|------|--------|
-| `400` | frame not parsed; missing or duplicate `u`; `t` ∉ {2, 3, 4}; `p` not an object; a required field missing or of the wrong type | on `/register` — close `1008`; otherwise lives |
+| `400` | frame not parsed; missing or duplicate `u`; `t` not an integer in {2, 3, 4}; JSON nested deeper than 128; `p` not an object; a required field missing or of the wrong type | on `/register` — close `1008`; otherwise lives |
 | `403` | `address` outside `allowed_cidr` | close `1008` |
 | `404` | unknown `a` | lives |
 | `409` | a prefix of another module; a CALL before `/register` | on `/register` — close `1008`; otherwise lives |

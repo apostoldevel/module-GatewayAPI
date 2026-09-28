@@ -50,6 +50,33 @@ int int_or(const nlohmann::json& o, const char* key, int def)
     return it != o.end() && it->is_number_integer() ? it->get<int>() : def;
 }
 
+// The same for a string. A frame's fields are read through these two, not
+// json::value(): value() throws on a field of another type, and a frame is
+// handled in the socket's epoll callback, where an exception that escapes
+// ends the worker (T644).
+std::string str_or(const nlohmann::json& o, const char* key, std::string def)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_string() ? it->get<std::string>() : std::move(def);
+}
+
+// Deepest nesting accepted in JSON from a module or a control-plane caller.
+// nlohmann parses without recursion but copies and serialises recursively:
+// a frame nested deep enough overflows the worker's stack even under the
+// 64 KiB frame limit (measured: ~11k levels on a debug build). That is a
+// signal, not an exception — no catch sees it. The protocol nests a few
+// levels; 128 is far above them.
+constexpr int k_max_json_depth = 128;
+
+json parse_bounded(const std::string& text)
+{
+    return json::parse(text, [](int depth, json::parse_event_t, json&) {
+        if (depth > k_max_json_depth)
+            throw std::out_of_range("JSON nested deeper than allowed");
+        return true;
+    });
+}
+
 } // namespace
 
 // ─── ctor / config ───────────────────────────────────────────────────────────
@@ -396,7 +423,8 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
 
     json p = json::object();
     if (!req.body.empty()) {
-        p = json::parse(req.body, nullptr, false);
+        try { p = parse_bounded(req.body); }
+        catch (const std::exception&) { p = nullptr; }
         if (!p.is_object()) {
             reply_problem(resp, 400, "bad-request", "Bad Request", "body must be a JSON object", req.path);
             return;
@@ -608,41 +636,70 @@ void GatewayAPI::on_ws_message(const std::shared_ptr<Node>& node, uint8_t opcode
         return;
     }
 
-    json msg = json::parse(payload, nullptr, false);
+    // This runs in the socket's epoll callback, outside the HTTP dispatcher's
+    // try: an exception that leaves it ends the worker process, every node
+    // and every HTTP call in flight on it (T644). Fields are read by type
+    // (int_or/str_or), and whatever still throws below is answered, not
+    // propagated. A catch does not cover a stack overflow: the depth is
+    // bounded at parse, and p is moved out, not copied.
+    json msg;
+    try { msg = parse_bounded(payload); }
+    catch (const std::out_of_range&) {
+        log_.warn("GatewayAPI: {}/{} from {}: frame nested deeper than {} refused", node->module,
+                  node->instance, node->peer_ip, k_max_json_depth);
+        send_call_error(*node->ws, "", 400, fmt::format("frame nested deeper than {}", k_max_json_depth));
+        return;
+    }
+    catch (const std::exception&) { msg = nullptr; }
     if (!msg.is_object()) {
         send_call_error(*node->ws, "", 400, "frame is not a JSON object");
         return;
     }
-    const int t = msg.value("t", -1);
-    std::string u;
-    if (msg.contains("u") && msg["u"].is_string()) u = msg["u"].get<std::string>();
+    const int t = int_or(msg, "t", -1);
+    const std::string u = str_or(msg, "u", "");
 
-    switch (t) {
-        case 2: {
-            if (u.empty()) { send_call_error(*node->ws, "", 400, "missing u"); return; }
-            // "duplicate u in flight" cannot happen here: every CALL is
-            // answered synchronously inside this callback, so nothing from
-            // the module is ever in flight when the next frame is parsed.
-            std::string action = msg.value("a", "");
-            json p = msg.contains("p") ? msg["p"] : json::object();
-            if (!p.is_object()) {
-                send_call_error(*node->ws, u, 400, "p must be an object");
+    try {
+        switch (t) {
+            case 2: {
+                if (u.empty()) { send_call_error(*node->ws, "", 400, "missing u"); return; }
+                // "duplicate u in flight" cannot happen here: every CALL is
+                // answered synchronously inside this callback, so nothing from
+                // the module is ever in flight when the next frame is parsed.
+                auto a = msg.find("a");
+                if (a == msg.end() || !a->is_string()) {
+                    send_call_error(*node->ws, u, 400, "missing or non-string a");
+                    return;
+                }
+                const std::string action = a->get<std::string>();
+                json p = json::object();
+                if (auto it = msg.find("p"); it != msg.end()) p = std::move(*it);
+                if (!p.is_object()) {
+                    send_call_error(*node->ws, u, 400, "p must be an object");
+                    return;
+                }
+                on_call(node, u, action, p);
                 return;
             }
-            on_call(node, u, action, p);
-            return;
+            case 3:
+            case 4:
+                on_reply(node, msg);
+                return;
+            case 0:
+            case 1:
+                send_call_error(*node->ws, u, 400, "OPEN/CLOSE are not used on the control plane");
+                return;
+            default:
+                send_call_error(*node->ws, u, 400, "unknown message type");
+                return;
         }
-        case 3:
-        case 4:
-            on_reply(node, msg);
-            return;
-        case 0:
-        case 1:
-            send_call_error(*node->ws, u, 400, "OPEN/CLOSE are not used on the control plane");
-            return;
-        default:
-            send_call_error(*node->ws, u, 400, "unknown message type");
-            return;
+    } catch (const json::exception& e) {
+        log_.warn("GatewayAPI: {}/{} from {}: frame refused: {}", node->module, node->instance,
+                  node->peer_ip, e.what());
+        if (!node->closing) send_call_error(*node->ws, u, 400, "invalid message");
+    } catch (const std::exception& e) {
+        log_.error("GatewayAPI: {}/{} from {}: frame failed: {}", node->module, node->instance,
+                   node->peer_ip, e.what());
+        if (!node->closing) send_call_error(*node->ws, u, 500, "internal error");
     }
 }
 
@@ -662,7 +719,7 @@ void GatewayAPI::on_call(const std::shared_ptr<Node>& node, const std::string& u
 
 void GatewayAPI::on_reply(const std::shared_ptr<Node>& node, const json& msg)
 {
-    std::string u = msg.value("u", "");
+    const std::string u = str_or(msg, "u", "");
     auto it = node->pending.find(u);
     if (it == node->pending.end()) {
         log_.debug("GatewayAPI: {}/{}: reply to unknown u={}", node->module, node->instance, u);
@@ -671,23 +728,36 @@ void GatewayAPI::on_reply(const std::shared_ptr<Node>& node, const json& msg)
     PendingCall call = std::move(it->second);
     node->pending.erase(it);
 
-    const int t = msg.value("t", -1);
+    const int t = int_or(msg, "t", -1);
     log_.debug("GatewayAPI: {}/{}: {} answered ({}) in {} ms", node->module, node->instance,
                call.action, t == 3 ? "result" : "error",
                std::chrono::duration_cast<std::chrono::milliseconds>(clock_t_::now() - call.sent).count());
 
-    if (call.http_conn) {
+    if (!call.http_conn) return;
+    // The call is already out of pending: whatever happens below, the HTTP
+    // caller is answered here or never — nothing else will find it.
+    auto conn = std::static_pointer_cast<HttpConnection>(call.http_conn);
+    try {
         HttpResponse r;
         if (t == 3) {
-            json p = msg.contains("p") ? msg["p"] : json::object();
-            r.set_status(200, "OK").set_body(p.dump(), "application/json");
+            auto p = msg.find("p");
+            r.set_status(200, "OK").set_body(p != msg.end() ? p->dump() : std::string("{}"),
+                                             "application/json");
         } else {
             reply_problem(r, 502, "upstream-error", "Bad Gateway",
                           fmt::format("module answered {} with {}: {}", call.action,
-                                      msg.value("c", 0), msg.value("m", "")),
+                                      int_or(msg, "c", 0), str_or(msg, "m", "")),
                           control_path_);
         }
-        std::static_pointer_cast<HttpConnection>(call.http_conn)->send_response(r);
+        conn->send_response(r);
+    } catch (const std::exception& e) {
+        log_.warn("GatewayAPI: {}/{}: reply to {} refused: {}", node->module, node->instance,
+                  call.action, e.what());
+        HttpResponse r;
+        reply_problem(r, 502, "upstream-error", "Bad Gateway",
+                      fmt::format("module answered {} with a malformed reply", call.action),
+                      control_path_);
+        conn->send_response(r);
     }
 }
 
@@ -842,7 +912,11 @@ void GatewayAPI::handle_heartbeat(const std::shared_ptr<Node>& node, const std::
 
 void GatewayAPI::handle_status(const std::shared_ptr<Node>& node, const std::string& u, const json& p)
 {
-    const std::string state = p.value("state", "");
+    if (!p.contains("state") || !p["state"].is_string()) {
+        send_call_error(*node->ws, u, 400, "missing or non-string state");
+        return;
+    }
+    const std::string state = p["state"].get<std::string>();
     if (state != "ready" && state != "draining" && state != "overloaded") {
         send_call_error(*node->ws, u, 422, "state must be ready|draining|overloaded");
         return;
@@ -863,7 +937,7 @@ void GatewayAPI::handle_status(const std::shared_ptr<Node>& node, const std::str
 
 void GatewayAPI::handle_unregister(const std::shared_ptr<Node>& node, const std::string& u, const json& p)
 {
-    const std::string reason = p.value("reason", "");
+    const std::string reason = str_or(p, "reason", "");
     if (auto* inst = find_instance(node->module, node->instance))
         set_state(*inst, "offline", fmt::format("unregister: {}", reason));
     send_call_result(*node->ws, u, json::object());
@@ -1400,19 +1474,30 @@ void GatewayAPI::mirror_next()
     // cut off by a connection error — on_exception is for an SQL error only.
     // With the database away this write simply waits; heartbeat() notices
     // the age of mirror_sent_ and says so.
-    db_.execute(std::move(w.sql),
-        [this, what, on_result = std::move(w.on_result)](std::vector<PgResult> results) {
-            if (on_result) {
-                try { on_result(std::move(results)); }
-                catch (const std::exception& e) { mirror_warn(what, e.what()); }
-            }
-            mirror_next();
-        },
-        [this, what](std::string_view error) {
-            mirror_warn(what, error);
-            mirror_next();
-        },
-        true);   // quiet: seen and sweep are periodic, transitions are logged by set_state
+    // execute() itself can throw (epoll registration of a reconnect). The
+    // write goes back to the head of the queue and the queue is released —
+    // the next mirror_exec() retries it. Left busy, the mirror would stop for
+    // the life of the worker: this used to be moot while any throw on a
+    // frame ended the worker, and is not since the frame handler catches (T644).
+    try {
+        db_.execute(w.sql,
+            [this, what, on_result = w.on_result](std::vector<PgResult> results) {
+                if (on_result) {
+                    try { on_result(std::move(results)); }
+                    catch (const std::exception& e) { mirror_warn(what, e.what()); }
+                }
+                mirror_next();
+            },
+            [this, what](std::string_view error) {
+                mirror_warn(what, error);
+                mirror_next();
+            },
+            true);   // quiet: seen and sweep are periodic, transitions are logged by set_state
+    } catch (const std::exception& e) {
+        mirror_warn(what, e.what());
+        mirror_queue_.push_front(std::move(w));
+        mirror_busy_ = false;
+    }
 }
 
 void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason, std::string_view reason, bool reassert)
@@ -1636,7 +1721,7 @@ void GatewayAPI::on_gateway_notify(std::string_view payload)
 
 void GatewayAPI::on_gateway_notify_(std::string_view payload)
 {
-    json msg = json::parse(payload);
+    json msg = parse_bounded(std::string(payload));
     if (!msg.is_object()) return;
 
     const std::string module   = msg.value("module", "");
