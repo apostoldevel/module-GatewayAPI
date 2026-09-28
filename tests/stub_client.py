@@ -942,7 +942,8 @@ async def scenario_listen_lost(gw, tok, pg_dsn):
             c = pg.cursor()
             c.execute("BEGIN")
             # No NOTIFY at all where the role may do it (triggers off for this transaction): the
-            # row can then reach the gateway only through a reload, whatever the listener's timing.
+            # row can then reach the gateway only through a reload, and the listeners are killed
+            # once it is committed (below), so the reload on re-LISTEN is bound to see it.
             # Otherwise the listeners are signalled in the same transaction — its NOTIFY goes to
             # backends on their way out, which a listener reconnecting within milliseconds can beat.
             c.execute("SAVEPOINT s")
@@ -952,14 +953,23 @@ async def scenario_listen_lost(gw, tok, pg_dsn):
             except psycopg2.Error:
                 c.execute("ROLLBACK TO SAVEPOINT s")
                 silent = False
-            c.execute("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity"
-                      " WHERE datname = current_database() AND query ILIKE 'LISTEN%%' AND pid <> pg_backend_pid()")
-            killed = c.fetchone()[0]
+            if not silent:
+                c.execute("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity"
+                          " WHERE datname = current_database() AND query ILIKE 'LISTEN%%' AND pid <> pg_backend_pid()")
+                killed = c.fetchone()[0]
             c.execute("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
                       " VALUES ('lost', %s, '0', %s, ARRAY[%s], 'ready', 1, NULL)"
                       " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = NULL, seen = now()",
                       (name, f"127.0.0.1:{18180 + n}", f"/api/v2/{name}"))
             c.execute("COMMIT")
+            if silent:
+                # Killed only once the row is committed: killed inside the transaction, a listener
+                # back within milliseconds re-reads before the COMMIT is visible (the WAL flush),
+                # and a row with no NOTIFY committed after the re-LISTEN is a case only the
+                # periodic reload covers — not the lost NOTIFY this scenario is about.
+                c.execute("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity"
+                          " WHERE datname = current_database() AND query ILIKE 'LISTEN%%' AND pid <> pg_backend_pid()")
+                killed = c.fetchone()[0]
             check(killed >= 2, f"round {n + 1}: the listeners of both gateways killed ({killed}; NOTIFY {'suppressed' if silent else 'sent'})")
             t0 = time.time()
             while time.time() - t0 < RELOAD and listing(gw, tok).get(("lost", name), {}).get("state") != "ready":
