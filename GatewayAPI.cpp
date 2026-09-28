@@ -450,23 +450,6 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
         return;
     }
 
-    // Only the worker holding the socket can talk to the module. A command
-    // that lands on another worker answers 409 — the caller retries and nginx
-    // spreads it; the mirror says which worker holds it.
-    std::shared_ptr<Node> target = socket_of(module, instance);
-    if (!target) {
-        // The mirror knows who holds it: the caller retries and nginx spreads
-        // it; the owner pid is in the detail for a reader, not for routing.
-        const auto* known = find_instance(module, instance);
-        reply_problem(resp, 409, "not-on-this-worker", "Conflict",
-                      known && known->source == Source::mirror
-                          ? fmt::format("instance {}/{} holds no socket on worker {}; owner worker {}",
-                                        module, instance, pid_, known->owner_worker)
-                          : fmt::format("instance {}/{} holds no socket on worker {}", module, instance, pid_),
-                      req.path);
-        return;
-    }
-
     json p = json::object();
     if (!req.body.empty()) {
         p = json::parse(req.body, nullptr, false);
@@ -476,8 +459,51 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
         }
     }
 
+    // Only the worker holding the socket can talk to the module.
+    if (auto target = socket_of(module, instance)) {
+        resp.set_deferred(true);
+        send_call(target, "/" + command, p,
+                  [this, conn = req.connection_ctx](const Answer& a) { respond(conn, a); });
+        return;
+    }
+
+    // Held elsewhere — by the table: an instance it does not know, or knows
+    // offline, is not relayed; before the first reload the table knows only
+    // this worker's sockets, and a miss is not an answer yet (3в).
+    const auto* known = find_instance(module, instance);
+    if (!known || known->state == "offline") {
+        if (!table_loaded_) {
+            reply_problem(resp, 503, "no-instance", "Service Unavailable", miss_detail(false), req.path);
+            resp.set_header("Retry-After", "1");
+        } else {
+            reply_problem(resp, 404, "unknown-instance", "Not Found",
+                          fmt::format("instance {}/{} is {}", module, instance, known ? "offline" : "not registered"),
+                          req.path);
+        }
+        return;
+    }
+    if (!cmd_listening_) {
+        // The holder's answer comes back over LISTEN gateway_cmd — not
+        // confirmed yet on this worker (a fresh one, or the database away).
+        reply_problem(resp, 503, "database-unavailable", "Service Unavailable",
+                      "the command channel is not listening yet", req.path);
+        resp.set_header("Retry-After", "1");
+        return;
+    }
     resp.set_deferred(true);
-    send_call(target, "/" + command, p, req.connection_ctx);
+    relay_command(module, instance, command, p, req.connection_ctx);
+}
+
+void GatewayAPI::respond(const std::shared_ptr<void>& http_conn, const Answer& a) const
+{
+    if (!http_conn) return;
+    HttpResponse r;
+    if (a.status == 200)
+        r.set_status(200, "OK").set_body(a.body.dump(), "application/json");
+    else
+        reply_problem(r, a.status, a.slug, a.title, a.detail, control_path_);
+    if (a.status == 503) r.set_header("Retry-After", "1");
+    std::static_pointer_cast<HttpConnection>(http_conn)->send_response(r);
 }
 
 // ─── WebSocket: upgrade, epoll, teardown ─────────────────────────────────────
@@ -597,16 +623,12 @@ void GatewayAPI::close_node(const std::shared_ptr<Node>& node, uint16_t code, st
     node->closing = true;
     node->ws->send_close(code, reason);
     // Any HTTP caller waiting on this node gets 502 now.
-    for (auto& [u, call] : node->pending) {
-        if (call.http_conn) {
-            HttpResponse r;
-            reply_problem(r, 502, "upstream-error", "Bad Gateway",
-                          fmt::format("socket closed ({}) before {} was answered", reason, call.action),
-                          control_path_);
-            std::static_pointer_cast<HttpConnection>(call.http_conn)->send_response(r);
-        }
-    }
+    auto pending = std::move(node->pending);
     node->pending.clear();
+    for (auto& [u, call] : pending)
+        if (call.answer)
+            call.answer({502, {}, "upstream-error", "Bad Gateway",
+                         fmt::format("socket closed ({}) before {} was answered", reason, call.action)});
     // Closing handshake (RFC 6455 §7.1.2): the socket stays in epoll until
     // the peer answers with its own close frame — on_readable then returns
     // false and drop_node runs — or until the grace deadline in heartbeat()
@@ -622,16 +644,12 @@ void GatewayAPI::drop_node(const std::shared_ptr<Node>& node)
     nodes_.erase(it);
     loop_.remove_io(fd);
 
-    for (auto& [u, call] : node->pending) {
-        if (call.http_conn) {
-            HttpResponse r;
-            reply_problem(r, 502, "upstream-error", "Bad Gateway",
-                          fmt::format("socket closed before {} was answered", call.action),
-                          control_path_);
-            std::static_pointer_cast<HttpConnection>(call.http_conn)->send_response(r);
-        }
-    }
+    auto pending = std::move(node->pending);
     node->pending.clear();
+    for (auto& [u, call] : pending)
+        if (call.answer)
+            call.answer({502, {}, "upstream-error", "Bad Gateway",
+                         fmt::format("socket closed before {} was answered", call.action)});
 
     // A close WE started (unregister, heartbeat timeout, replacement) wrote
     // the state before calling close_node; only a close the PEER started
@@ -660,10 +678,10 @@ void GatewayAPI::send_call_error(WsConnection& ws, std::string_view u, int code,
 }
 
 void GatewayAPI::send_call(const std::shared_ptr<Node>& node, std::string_view action,
-                           const json& p, std::shared_ptr<void> http_conn)
+                           const json& p, AnswerFn answer)
 {
     const std::string u = new_uuid();
-    node->pending[u] = PendingCall{std::string(action), clock_t_::now(), std::move(http_conn)};
+    node->pending[u] = PendingCall{std::string(action), clock_t_::now(), std::move(answer)};
     json msg = {{"t", 2}, {"u", u}, {"a", action}, {"p", p}};
     node->ws->send_text(msg.dump());
 }
@@ -750,18 +768,13 @@ void GatewayAPI::on_reply(const std::shared_ptr<Node>& node, const json& msg)
                call.action, t == 3 ? "result" : "error",
                std::chrono::duration_cast<std::chrono::milliseconds>(clock_t_::now() - call.sent).count());
 
-    if (call.http_conn) {
-        HttpResponse r;
-        if (t == 3) {
-            json p = msg.contains("p") ? msg["p"] : json::object();
-            r.set_status(200, "OK").set_body(p.dump(), "application/json");
-        } else {
-            reply_problem(r, 502, "upstream-error", "Bad Gateway",
-                          fmt::format("module answered {} with {}: {}", call.action,
-                                      msg.value("c", 0), msg.value("m", "")),
-                          control_path_);
-        }
-        std::static_pointer_cast<HttpConnection>(call.http_conn)->send_response(r);
+    if (call.answer) {
+        if (t == 3)
+            call.answer({200, msg.contains("p") ? msg["p"] : json::object(), {}, {}, {}});
+        else
+            call.answer({502, {}, "upstream-error", "Bad Gateway",
+                         fmt::format("module answered {} with {}: {}", call.action,
+                                     msg.value("c", 0), msg.value("m", ""))});
     }
 }
 
@@ -1346,6 +1359,7 @@ void GatewayAPI::on_stop()
     // the shutdown drain (drain_db) counts database queries only, so a
     // forward gets no grace the way an AppServer query does.
     upstreams_.clear();
+    relays_.clear();   // their connections are closing with the worker
     stopping_ = true;
 }
 
@@ -1374,8 +1388,14 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
                        next_reload_ = clock_t_::now() + std::chrono::seconds(reload_interval_);
                        mirror_reload();
                    });
+        // The answer to a relayed command comes back on gateway_cmd: relay
+        // nothing until this worker is listening there.
+        db_.listen("gateway_cmd", [this](std::string_view, std::string_view payload) { on_cmd_notify(payload); },
+                   [this](std::string_view) { cmd_listening_ = true; });
 #else
         db_.listen("gateway", [this](std::string_view, std::string_view payload) { on_gateway_notify(payload); });
+        db_.listen("gateway_cmd", [this](std::string_view, std::string_view payload) { on_cmd_notify(payload); });
+        cmd_listening_ = true;   // no acknowledgement to wait for: an answer before LISTEN is a 504
 #endif
         next_seen_   = now + std::chrono::seconds(heartbeat_interval_);
         // Until the first reload lands a miss is 503, not 404 (table_loaded_).
@@ -1394,6 +1414,29 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
     if (mirror_busy_ && seconds_since(mirror_sent_, now) >= reload_interval_)
         mirror_warn("write", fmt::format("outstanding for {} s, {} more queued", seconds_since(mirror_sent_, now),
                                          mirror_queue_.size()));
+
+    // Relayed commands not answered within k_relay_answer_s. Any answer that
+    // came before wins, whether pg_notify has returned or not: its result can
+    // be lost with the connection (the pool re-queues the statement) after the
+    // command was committed and run.
+    for (auto it = relays_.begin(); it != relays_.end();) {
+        if (now - it->second.sent < std::chrono::seconds(k_relay_answer_s)) { ++it; continue; }
+        const bool unsent = !it->second.notified;
+        auto conn = std::move(it->second.http_conn);
+        const std::string what = it->second.what;
+        it = relays_.erase(it);
+        if (unsent) {
+            log_.warn("GatewayAPI: {}: not relayed — pg_notify has not returned in {} s", what, k_relay_answer_s);
+            respond(conn, {503, {}, "database-unavailable", "Service Unavailable",
+                           fmt::format("the database did not take the command in {} s", k_relay_answer_s)});
+        } else {
+            log_.warn("GatewayAPI: {}: relayed, no worker holding the socket answered in {} s", what, k_relay_answer_s);
+            respond(conn, {504, {}, "upstream-timeout", "Gateway Timeout",
+                           fmt::format("relayed; no worker holding the socket answered in {} s", k_relay_answer_s)});
+        }
+    }
+    // A second past the deadline: until then a replay must still find its id.
+    std::erase_if(cmd_seen_, [now](const auto& e) { return e.second + std::chrono::seconds(1) < now; });
 
     // Copy: close_node/drop_node mutate nodes_.
     std::vector<std::shared_ptr<Node>> nodes;
@@ -1422,14 +1465,12 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
             if (seconds_since(it->second.sent, now) >= k_call_timeout_s) {
                 log_.warn("GatewayAPI: {}/{}: {} not answered in {} s", node->module, node->instance,
                           it->second.action, k_call_timeout_s);
-                if (it->second.http_conn) {
-                    HttpResponse r;
-                    reply_problem(r, 504, "upstream-timeout", "Gateway Timeout",
-                                  fmt::format("{} not answered in {} s", it->second.action, k_call_timeout_s),
-                                  control_path_);
-                    std::static_pointer_cast<HttpConnection>(it->second.http_conn)->send_response(r);
-                }
+                auto answer = std::move(it->second.answer);
+                const std::string action = it->second.action;
                 it = node->pending.erase(it);
+                if (answer)
+                    answer({504, {}, "upstream-timeout", "Gateway Timeout",
+                            fmt::format("{} not answered in {} s", action, k_call_timeout_s)});
             } else {
                 ++it;
             }
@@ -1976,6 +2017,206 @@ void GatewayAPI::on_gateway_notify_(std::string_view payload)
         return;
     }
     mirror_apply(msg, "notify");
+}
+
+// ─── commands across workers (gateway_cmd) ───────────────────────────────────
+//
+// Wire form: "<64 hex of HMAC-SHA256>.<json>", the MAC over the json text as
+// sent. pg_notify is open to any role with CONNECT and a LISTEN on the channel
+// sees every payload: an unsigned command would let any of them drain a module
+// (irreversible) or answer an operator in the module's name. A captured
+// message replayed is stopped by its deadline and, within it, by its id.
+
+namespace {
+
+long long epoch_ms(clock_t_::time_point t)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
+}
+
+bool same_mac(std::string_view a, std::string_view b)
+{
+    if (a.size() != b.size()) return false;
+    unsigned char d = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) d |= static_cast<unsigned char>(a[i] ^ b[i]);
+    return d == 0;
+}
+
+bool is_command(std::string_view c) { return c == "ping" || c == "drain" || c == "reload"; }
+
+} // namespace
+
+std::string GatewayAPI::cmd_key() const
+{
+    const auto* app = providers_.find_default(audience_);
+    if (!app || app->client_secret.empty()) return {};
+    // Not the secret itself: it signs the audience's tokens too, and a key of
+    // the channel's own keeps one kind of signature from passing for the other.
+    return hmac_sha256_hex(app->client_secret, "apostol:gateway_cmd");
+}
+
+std::string GatewayAPI::cmd_sign(const json& body) const
+{
+    const auto key = cmd_key();
+    if (key.empty()) return {};
+    std::string text = body.dump(-1, ' ', false, json::error_handler_t::replace);
+    return hmac_sha256_hex(key, text) + "." + text;
+}
+
+void GatewayAPI::cmd_notify(std::string payload, std::function<void()> on_sent,
+                            std::function<void(std::string_view)> on_fail)
+{
+    // Not through mirror_exec: nothing orders a command against the mirror,
+    // and a queue stalled behind the database would hold it past its deadline.
+    db_.execute(fmt::format("SELECT pg_notify('gateway_cmd', {})", pq_quote_literal(payload)),
+        [on_sent = std::move(on_sent)](std::vector<PgResult>) { if (on_sent) on_sent(); },
+        [on_fail = std::move(on_fail)](std::string_view error) { if (on_fail) on_fail(error); },
+        /*quiet=*/true);
+}
+
+void GatewayAPI::relay_command(const std::string& module, const std::string& instance, const std::string& command,
+                               const json& p, std::shared_ptr<void> http_conn)
+{
+    const std::string id  = new_uuid();
+    const auto        now = clock_t_::now();
+    const std::string what = fmt::format("{}/{} {}", module, instance, command);
+    const json body = {
+        {"k", "cmd"}, {"id", id}, {"from", pid_},
+        {"module", module}, {"instance", instance}, {"command", command}, {"p", p},
+        {"deadline", epoch_ms(now + std::chrono::seconds(k_relay_send_s))},
+    };
+    std::string payload = cmd_sign(body);
+    if (payload.empty()) {
+        // A configuration fault, not a transient one: no Retry-After.
+        respond(http_conn, {500, {}, "internal", "Internal Server Error",
+                            "the command channel has no key: the audience secret is not configured"});
+        return;
+    }
+    if (payload.size() > k_notify_max_bytes) {
+        respond(http_conn, {400, {}, "bad-request", "Bad Request",
+                            fmt::format("body too large to relay: {} bytes signed, the channel carries {}",
+                                        payload.size(), k_notify_max_bytes)});
+        return;
+    }
+    relays_[id] = Relay{std::move(http_conn), what, now};
+    log_.debug("GatewayAPI: {}: no socket on worker {} — relayed as {}", what, pid_, id);
+    cmd_notify(std::move(payload),
+        [this, id]() { if (auto it = relays_.find(id); it != relays_.end()) it->second.notified = true; },
+        [this, id](std::string_view error) {
+            // An SQL error: the statement did not commit, nothing reached the
+            // channel. (A lost connection is not reported here — the pool
+            // re-queues the statement.)
+            auto it = relays_.find(id);
+            if (it == relays_.end()) return;
+            auto conn = std::move(it->second.http_conn);
+            const std::string w = it->second.what;
+            relays_.erase(it);
+            log_.warn("GatewayAPI: {}: not relayed: {}", w, error);
+            respond(conn, {503, {}, "database-unavailable", "Service Unavailable", "the database refused the command"});
+        });
+}
+
+void GatewayAPI::cmd_answer(const std::string& id, int to, const Answer& a)
+{
+    json body = {{"k", "reply"}, {"id", id}, {"by", pid_}, {"status", a.status}};
+    if (a.status == 200) body["body"] = a.body;
+    else { body["slug"] = a.slug; body["title"] = a.title; body["detail"] = a.detail; }
+    std::string payload = cmd_sign(body);
+    if (payload.size() > k_notify_max_bytes) {
+        body.erase("body");
+        body["status"] = 502; body["slug"] = "upstream-error"; body["title"] = "Bad Gateway";
+        body["detail"] = fmt::format("the module's answer is too large to relay: {} bytes signed, the channel carries {}",
+                                     payload.size(), k_notify_max_bytes);
+        payload = cmd_sign(body);
+    }
+    if (payload.empty()) return;   // no key: the requester will answer 504
+    cmd_notify(std::move(payload), {}, [this, id, to](std::string_view error) {
+        log_.warn("GatewayAPI: answer to command {} of worker {} not sent: {}", id, to, error);
+    });
+}
+
+void GatewayAPI::cmd_refused(std::string_view reason)
+{
+    // Throttled as mirror_refused: any role can fill the channel.
+    const auto now = clock_t_::now();
+    if (now < cmd_warned_) { ++cmd_quiet_; return; }
+    cmd_warned_ = now + std::chrono::seconds(reload_interval_);
+    log_.warn("GatewayAPI: gateway_cmd message refused: {}{}", reason,
+              cmd_quiet_ ? fmt::format(" (+{} refused in the last {} s, not logged)", cmd_quiet_, reload_interval_)
+                         : std::string{});
+    cmd_quiet_ = 0;
+}
+
+void GatewayAPI::on_cmd_notify(std::string_view payload)
+{
+    // Anything on the channel reaches here; nothing above catches.
+    try { on_cmd_notify_(payload); }
+    catch (const std::exception& e) { cmd_refused(fmt::format("unreadable ({})", e.what())); }
+}
+
+void GatewayAPI::on_cmd_notify_(std::string_view payload)
+{
+    // Every worker gets every message: the signature is checked first, and
+    // nothing of an unsigned payload reaches the log.
+    constexpr std::size_t mac_len = 64;
+    if (payload.size() <= mac_len || payload[mac_len] != '.') { cmd_refused("not signed"); return; }
+    const auto key = cmd_key();
+    if (key.empty()) { cmd_refused("no key: the audience secret is not configured"); return; }
+    const std::string_view text = payload.substr(mac_len + 1);
+    if (!same_mac(payload.substr(0, mac_len), hmac_sha256_hex(key, text))) { cmd_refused("bad signature"); return; }
+
+    const json msg = json::parse(text);
+    if (!msg.is_object()) { cmd_refused("not an object"); return; }
+    const std::string kind = msg.value("k", "");
+    const std::string id   = msg.value("id", "");
+
+    if (kind == "reply") {
+        auto it = relays_.find(id);
+        if (it == relays_.end()) return;   // another worker's, or given up on
+        // Built before the relay is taken: a field of the wrong type throws,
+        // and the request then still gets its 504 instead of nothing.
+        Answer a{int_or(msg, "status", 502), msg.contains("body") ? msg["body"] : json::object(),
+                 msg.value("slug", "upstream-error"), msg.value("title", "Bad Gateway"), msg.value("detail", "")};
+        auto conn = std::move(it->second.http_conn);
+        const std::string what = it->second.what;
+        relays_.erase(it);
+        log_.debug("GatewayAPI: {}: answered {} by worker {}", what, a.status, int_or(msg, "by", 0));
+        respond(conn, a);
+        return;
+    }
+    if (kind != "cmd") { cmd_refused("unknown kind"); return; }
+
+    const std::string module   = msg.value("module", "");
+    const std::string instance = msg.value("instance", "");
+    const std::string command  = msg.value("command", "");
+    if (!valid_name(module) || !valid_name(instance) || !is_command(command) || id.empty() ||
+        !msg.contains("p") || !msg["p"].is_object()) {
+        cmd_refused("malformed command");
+        return;
+    }
+    auto node = socket_of(module, instance);
+    if (!node) return;   // held elsewhere, or by nobody: the requester answers 504
+
+    const int  from     = int_or(msg, "from", 0);
+    const auto now      = clock_t_::now();
+    const long long due = msg.value("deadline", 0LL);
+    if (epoch_ms(now) > due) {
+        // Given up on by the requester: a late drain must not run after the
+        // caller was told the command did not go.
+        cmd_refused(fmt::format("{}/{} {} from worker {}: past its deadline by {} ms", module, instance, command,
+                                from, epoch_ms(now) - due));
+        return;
+    }
+    if (due > epoch_ms(now + std::chrono::seconds(k_relay_send_s + 60))) {
+        cmd_refused(fmt::format("{}/{} {} from worker {}: deadline too far ahead", module, instance, command, from));
+        return;
+    }
+    if (!cmd_seen_.emplace(id, clock_t_::time_point(std::chrono::milliseconds(due))).second) {
+        cmd_refused(fmt::format("{}/{} {} from worker {}: replayed id {}", module, instance, command, from, id));
+        return;
+    }
+    log_.notice("GatewayAPI: {}/{}: {} relayed by worker {}", module, instance, command, from);
+    send_call(node, "/" + command, msg["p"], [this, id, from](const Answer& a) { cmd_answer(id, from, a); });
 }
 
 } // namespace apostol

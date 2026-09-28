@@ -24,6 +24,10 @@ spawns new workers and retires the old ones, and every request through the peer 
 then is not yet a 404. Scenario 13 (`--pg`) kills the listening connections and commits a row in
 the same transaction: its NOTIFY is lost, and the row must appear on the reload the gateway runs
 when LISTEN is confirmed again, well before `reload_interval`. Scenario 11 is reserved for two processes with one identity (T592, 3е).
+Scenario 15 (`--peer`, `--pg`) sends commands through the peer to an instance whose socket this gateway holds:
+they are relayed over NOTIFY `gateway_cmd`, signed with a key of the audience secret; forged, replayed and late
+messages must not reach the module. With `--pg-container` it pauses the database's docker container for about ten
+seconds: the relay must answer 503, and the command that reaches the channel after the database is back must not run.
 
 Gateway configuration for a run: `heartbeat_interval` 2 (scenario 4 waits for suspect/offline by
 the clock), `allowed_cidr` with 127.0.0.0/8, `response_timeout_ms` 2000 (scenario 9 waits for a
@@ -311,8 +315,11 @@ async def scenario_commands(gw, tok):
           f"/drain → CALLRESULT, draining, unregister, close {cc}, offline")
 
     r = requests.post(f"{gw}/gateway/clients/nobody/ping", headers=hdr, timeout=5)
-    check(r.status_code == 409 and r.json()["type"] == "urn:apostol:gateway:not-on-this-worker",
-          "command to a nonexistent instance → 409 not-on-this-worker")
+    check(r.status_code == 404 and r.json()["type"] == "urn:apostol:gateway:unknown-instance",
+          "command to a nonexistent instance → 404 unknown-instance")
+    r = requests.post(f"{gw}/gateway/clients/k1/ping", headers=hdr, timeout=5)
+    check(r.status_code == 404 and r.json()["type"] == "urn:apostol:gateway:unknown-instance",
+          f"command to an offline instance → 404 unknown-instance ({r.json().get('detail')})")
 
 
 async def scenario_replace(gw, tok):
@@ -669,8 +676,14 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         r = await asyncio.to_thread(requests.get, f"{peer}/api/v2/mirror/ping", headers=hdrs, timeout=5)
         check(r.status_code == 200 and r.json()["target"] == "/api/v2/mirror/ping", "data plane THROUGH THE PEER reaches the module registered on my side")
         check(hdr(echo.seen[-1], "X-Gateway-Worker") == [str(other)], f"X-Gateway-Worker — peer's pid ({hdr(echo.seen[-1], 'X-Gateway-Worker')})")
-        r = requests.post(f"{peer}/gateway/mirror/m1/ping", headers=hdrs, timeout=5)
-        check(r.status_code == 409 and f"owner worker {me}" in r.json()["detail"], f"command to peer → 409 with owner's pid ({r.json()['detail']})")
+        # A command to the peer is relayed to my worker over gateway_cmd (scenario 15 has the details).
+        fut = asyncio.ensure_future(asyncio.to_thread(requests.post, f"{peer}/gateway/mirror/m1/ping",
+                                                      headers=hdrs, timeout=10))
+        m = await rx(ws)
+        await ws.send(json.dumps({"t": 3, "u": m["u"], "p": {"in_flight": 0}}))
+        r = await fut
+        check(m.get("a") == "/ping" and r.status_code == 200 and r.json() == {"in_flight": 0},
+              f"command to peer → relayed to my worker, the module answered: HTTP {r.status_code}")
 
         # 2. seen — once per interval, only on a live heartbeat: without a heartbeat seen ages,
         #    after a heartbeat it moves (we compare the timestamp itself, not the age)
@@ -1073,6 +1086,203 @@ async def scenario_prefix_handoff(gw, tok, pg_dsn):
         pg.close()
 
 
+def cmd_signed(body):
+    """The gateway_cmd wire form, signed the way a gateway worker signs it (README § Commands across workers)."""
+    import hashlib
+    import hmac
+    key = hmac.new(SECRET.encode(), b"apostol:gateway_cmd", hashlib.sha256).hexdigest()
+    text = json.dumps(body, separators=(",", ":"))
+    return hmac.new(key.encode(), text.encode(), hashlib.sha256).hexdigest() + "." + text
+
+
+async def scenario_commands_relayed(gw, tok, peer, pg_dsn, pg_container):
+    print("15. commands across workers: a command sent to a worker without the socket is relayed over gateway_cmd")
+    if not peer or not pg_dsn:
+        print("  [skip] needs --peer and --pg")
+        return
+    import subprocess
+    import psycopg2
+    hdr = {"Authorization": f"Bearer {tok}"}
+    loop = asyncio.get_event_loop()
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+    spy = psycopg2.connect(pg_dsn)   # sees every payload on the channel, as any role with CONNECT can
+    spy.autocommit = True
+    spy.cursor().execute("LISTEN gateway_cmd")
+
+    def post(base, path, timeout=12, **kw):
+        return loop.run_in_executor(None, lambda: requests.post(f"{base}/gateway/{path}", headers=hdr,
+                                                                timeout=timeout, **kw))
+
+    def captured():
+        spy.poll()
+        out = [n.payload for n in spy.notifies]
+        spy.notifies.clear()
+        return out
+
+    def notify(payload):
+        pg.cursor().execute("SELECT pg_notify('gateway_cmd', %s)", (payload,))
+
+    ws = await connect(gw, tok, "relay", "x1")
+    await register(ws, "relay", "x1")
+
+    async def beat():
+        # The scenario runs longer than offline_after heartbeats; the answers are skipped by the readers.
+        while True:
+            await asyncio.sleep(HB)
+            await ws.send(call("/heartbeat", {"in_flight": 0}))
+
+    async def next_call(timeout):
+        end = time.monotonic() + timeout
+        while True:
+            m = await rx(ws, timeout=max(0.01, end - time.monotonic()))
+            if m.get("t") == 2:
+                return m
+
+    beater = asyncio.ensure_future(beat())
+    try:
+        t0 = time.time()
+        while time.time() - t0 < RELOAD and listing(peer, tok).get(("relay", "x1"), {}).get("state") != "ready":
+            await asyncio.sleep(0.05)
+        check(listing(peer, tok).get(("relay", "x1"), {}).get("state") == "ready", "relay/x1 on this gateway, mirrored by the peer")
+
+        async def calls(within):
+            """CALLs the module gets within `within` s, each answered: /ping {in_flight: 7}, /reload CALLERROR."""
+            got = []
+            end = time.monotonic() + within
+            while (left := end - time.monotonic()) > 0:
+                try:
+                    m = await rx(ws, timeout=left)
+                except asyncio.TimeoutError:
+                    break
+                if m.get("t") != 2:
+                    continue
+                got.append(m["a"])
+                if m["a"] == "/reload":
+                    await ws.send(json.dumps({"t": 4, "u": m["u"], "c": 500, "m": "cannot reload"}))
+                else:
+                    await ws.send(json.dumps({"t": 3, "u": m["u"], "p": {"in_flight": 7}}))
+            return got
+
+        captured()
+        fut = post(peer, "relay/x1/ping")
+        got = await calls(2)
+        r = await fut
+        check(got == ["/ping"] and r.status_code == 200 and r.json() == {"in_flight": 7},
+              f"POST peer …/ping → relayed to the socket's worker, module answered once: HTTP {r.status_code} {r.text}")
+        wire = captured()
+        cmd = [w for w in wire if '"k":"cmd"' in w]
+        check(len(cmd) == 1 and len(wire) == 2 and all(len(w) > 65 and w[64] == "." for w in wire),
+              f"the channel carried one signed command and one signed answer ({len(wire)} payloads)")
+
+        # A genuine command replayed at once, well within its deadline: only its id stops it.
+        fut = post(peer, "relay/x1/ping")
+        first = await next_call(3)
+        spy.poll()
+        t0 = time.monotonic()
+        while not [n for n in spy.notifies if '"k":"cmd"' in n.payload]:
+            check(time.monotonic() - t0 < 2, "the relayed command seen on the channel")
+            await asyncio.sleep(0.02)
+            spy.poll()
+        notify([n.payload for n in spy.notifies if '"k":"cmd"' in n.payload][0])
+        await ws.send(json.dumps({"t": 3, "u": first["u"], "p": {"in_flight": 7}}))
+        r = await fut
+        got = await calls(1.5)
+        check(r.status_code == 200 and got == [],
+              "genuine command replayed within its deadline → the module got it once (the id is spent)")
+        captured()
+
+        fut = post(peer, "relay/x1/reload")
+        got = await calls(2)
+        r = await fut
+        check(got == ["/reload"] and r.status_code == 502 and r.json()["type"] == "urn:apostol:gateway:upstream-error",
+              f"module CALLERROR through the relay → 502 ({r.json().get('detail')})")
+
+        t0 = time.monotonic()
+        fut = post(peer, "relay/x1/ping", json={"x": 1})
+        m = await next_call(3)   # received, never answered
+        r = await fut
+        took = time.monotonic() - t0
+        check(m["a"] == "/ping" and r.status_code == 504 and 4 <= took <= 9,
+              f"module silent → 504 through the relay after {took:.1f} s ({r.json().get('detail')})")
+
+        # Forgeries — none may reach the module. A correctly signed twin follows them, so "no CALL" is not
+        # the module being deaf.
+        replay = cmd[0]
+        forged = [
+            ("unsigned", json.dumps({"k": "cmd", "id": str(uuid.uuid4()), "module": "relay", "instance": "x1",
+                                     "command": "drain", "p": {}, "deadline": int(time.time() * 1000) + 2000})),
+            ("wrong key", "0" * 64 + "." + json.dumps({"k": "cmd", "id": str(uuid.uuid4()), "module": "relay",
+                                                         "instance": "x1", "command": "drain", "p": {},
+                                                         "deadline": int(time.time() * 1000) + 2000})),
+            ("genuine, replayed after its deadline", replay),
+            ("signed, past its deadline", cmd_signed({"k": "cmd", "id": str(uuid.uuid4()), "from": 1, "module": "relay",
+                                                      "instance": "x1", "command": "drain", "p": {},
+                                                      "deadline": int(time.time() * 1000) - 1})),
+            ("signed, body altered", cmd_signed({"k": "cmd", "id": str(uuid.uuid4()), "from": 1, "module": "relay",
+                                                 "instance": "x1", "command": "ping", "p": {},
+                                                 "deadline": int(time.time() * 1000) + 2000}).replace('"ping"', '"drain"')),
+        ]
+        for what, payload in forged:
+            notify(payload)
+            got = await calls(1.5)
+            check(got == [], f"forged gateway_cmd ({what}) → no CALL reached the module")
+        captured()
+        notify(cmd_signed({"k": "cmd", "id": str(uuid.uuid4()), "from": 1, "module": "relay", "instance": "x1",
+                           "command": "ping", "p": {}, "deadline": int(time.time() * 1000) + 2000}))
+        got = await calls(1.5)
+        check(got == ["/ping"], "positive control: the same command signed with the audience key → the CALL arrives")
+
+        # A row every worker mirrors as ready, with no socket behind it anywhere: relayed, answered by nobody.
+        pg.cursor().execute(
+            "INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
+            " VALUES ('relay', 'ghost', '0', '127.0.0.1:18195', ARRAY['/api/v2/relayghost'], 'ready', 1, NULL)"
+            " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = NULL, seen = now()")
+        t0 = time.time()
+        while time.time() - t0 < RELOAD and listing(peer, tok).get(("relay", "ghost"), {}).get("state") != "ready":
+            await asyncio.sleep(0.05)
+        t0 = time.monotonic()
+        r = await post(peer, "relay/ghost/ping", timeout=15)   # not blocking: the heartbeats must go on
+        took = time.monotonic() - t0
+        check(r.status_code == 504 and "no worker holding the socket" in r.json().get("detail", "") and 9 <= took <= 11,
+              f"ready row with no socket anywhere → 504 by the relaying worker after {took:.1f} s")
+
+        r = await post(peer, "relay/nobody/ping", timeout=5)
+        check(r.status_code == 404 and r.json()["type"] == "urn:apostol:gateway:unknown-instance",
+              "unknown instance through the peer → 404 unknown-instance, nothing relayed")
+
+        if pg_container:
+            # The database away: pg_notify waits in the pool's queue with no error — 503 by its age. After the
+            # database is back, the queued command reaches the channel past its deadline and must not run.
+            subprocess.run(["docker", "pause", pg_container], check=True, capture_output=True)
+            try:
+                t0 = time.monotonic()
+                r = await post(peer, "relay/x1/ping")
+                took = time.monotonic() - t0
+            finally:
+                subprocess.run(["docker", "unpause", pg_container], check=True, capture_output=True)
+            check(r.status_code == 503 and r.json()["type"] == "urn:apostol:gateway:database-unavailable"
+                  and r.headers.get("Retry-After") == "1" and 9 <= took <= 11,
+                  f"database paused → 503 database-unavailable + Retry-After after {took:.1f} s ({r.json().get('detail')})")
+            got = await calls(3)
+            check(got == [], "the command queued while the database was away reached the channel late — not run")
+        else:
+            print("  [skip] database away: needs --pg-container")
+
+        fut = post(peer, "relay/x1/drain", json={"reason": "relay test"})
+        m = await next_call(3)
+        await ws.send(json.dumps({"t": 3, "u": m["u"], "p": {}}))
+        r = await fut
+        check(m["a"] == "/drain" and m["p"] == {"reason": "relay test"} and r.status_code == 200,
+              f"/drain through the peer → the body reached the module, HTTP {r.status_code}")
+    finally:
+        beater.cancel()
+        await ws.close()
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module = 'relay'")
+        pg.close()
+        spy.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -1083,6 +1293,7 @@ async def main():
     ap.add_argument("--pg", help="psycopg2 DSN for reading gateway.node/log (scenario 10)")
     ap.add_argument("--pg-password-file", help="password for --pg (otherwise PGPASSWORD)")
     ap.add_argument("--peer-master-pid", type=int, help="pid of the peer's master process (scenario 12 sends it SIGHUP)")
+    ap.add_argument("--pg-container", help="docker container of the database (scenario 15 pauses it for a few seconds)")
     args = ap.parse_args()
     if args.pg and args.pg_password_file:
         args.pg += " password=" + open(args.pg_password_file).read().strip()
@@ -1103,7 +1314,8 @@ async def main():
                  scenario_same_identity,
                  lambda gw, tok: scenario_fresh_worker(gw, tok, args.peer, args.peer_master_pid),
                  lambda gw, tok: scenario_listen_lost(gw, tok, args.pg),
-                 lambda gw, tok: scenario_prefix_handoff(gw, tok, args.pg)]
+                 lambda gw, tok: scenario_prefix_handoff(gw, tok, args.pg),
+                 lambda gw, tok: scenario_commands_relayed(gw, tok, args.peer, args.pg, args.pg_container)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):

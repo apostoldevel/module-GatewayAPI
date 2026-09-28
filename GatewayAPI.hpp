@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -139,12 +140,25 @@ protected:
 private:
     // ── One WebSocket connection = one node ────────────────────────────────
 
+    /// What a command to a module came to: 200 with the module's CALLRESULT
+    /// payload, or a problem (502 its CALLERROR or a lost socket, 504 no
+    /// answer). One shape for both ways back — straight to the HTTP caller,
+    /// or over `gateway_cmd` to the worker that relayed the command.
+    struct Answer
+    {
+        int            status{200};
+        nlohmann::json body;                  // status 200
+        std::string    slug, title, detail;   // otherwise
+    };
+    using AnswerFn = std::function<void(const Answer&)>;
+
     struct PendingCall
     {
         std::string action;
         std::chrono::system_clock::time_point sent;
-        // HTTP request waiting for the module's answer (POST /gateway/…/ping etc.)
-        std::shared_ptr<void> http_conn;
+        // Whoever waits for the module's answer (POST /gateway/…/ping etc.):
+        // empty for the gateway's own CALLs.
+        AnswerFn answer;
     };
 
     struct Node
@@ -161,6 +175,13 @@ private:
     };
 
     // ── HTTP (GET /gateway/list, POST /gateway/{m}/{i}/{ping|drain|reload}) ──
+    //
+    // A command is executed by the worker holding the socket. One that lands
+    // elsewhere is relayed over NOTIFY `gateway_cmd` (README § Commands across
+    // workers): signed with a key of the audience secret, since the channel is
+    // open to any role with CONNECT, carrying a deadline and an id; the
+    // holder answers on the same channel and the relaying worker matches the
+    // answer by the id.
 
     void do_get(const HttpRequest& req, HttpResponse& resp);
     void do_post(const HttpRequest& req, HttpResponse& resp);
@@ -231,7 +252,39 @@ private:
     static void send_call_result(WsConnection& ws, std::string_view u, const nlohmann::json& p);
     static void send_call_error (WsConnection& ws, std::string_view u, int code, std::string_view message);
     void send_call(const std::shared_ptr<Node>& node, std::string_view action,
-                   const nlohmann::json& p, std::shared_ptr<void> http_conn = {});
+                   const nlohmann::json& p, AnswerFn answer = {});
+    /// Hand a command's Answer to the HTTP connection waiting for it.
+    void respond(const std::shared_ptr<void>& http_conn, const Answer& a) const;
+
+    // ── Commands across workers (gateway_cmd) ──────────────────────────────
+
+    /// The requesting side: a command for an instance another worker holds.
+    struct Relay
+    {
+        std::shared_ptr<void> http_conn;
+        std::string what;                     // "module/instance/command", for the log
+        std::chrono::system_clock::time_point sent;
+        bool notified{false};                 // pg_notify returned: the command is on the channel
+    };
+    void relay_command(const std::string& module, const std::string& instance, const std::string& command,
+                       const nlohmann::json& p, std::shared_ptr<void> http_conn);
+    /// The wire form of @p body on `gateway_cmd`: "<hmac hex>.<json>"; empty
+    /// when there is no key.
+    std::string cmd_sign(const nlohmann::json& body) const;
+    /// NOTIFY `gateway_cmd` with @p payload (cmd_sign); @p on_sent — pg_notify
+    /// returned, @p on_fail — the database answered with an error.
+    void cmd_notify(std::string payload, std::function<void()> on_sent,
+                    std::function<void(std::string_view)> on_fail);
+    /// The holder's side: the module's answer to a relayed command, back to
+    /// the worker that relayed it.
+    void cmd_answer(const std::string& id, int to, const Answer& a);
+    void on_cmd_notify(std::string_view payload);
+    void on_cmd_notify_(std::string_view payload);
+    /// The HMAC key of the channel, derived from the audience secret; empty —
+    /// no secret, nothing is relayed or accepted.
+    std::string cmd_key() const;
+    /// A refused `gateway_cmd` message, throttled like mirror_refused().
+    void cmd_refused(std::string_view reason);
 
     // ── Table ──────────────────────────────────────────────────────────────
 
@@ -367,6 +420,17 @@ private:
     static constexpr std::size_t k_max_frame_bytes     = 64 * 1024;
     static constexpr int         k_close_grace_ms      = 1500;
     static constexpr int         k_passive_errors      = 5;      // connect failures → suspect
+    // gateway_cmd: a command carries a deadline k_relay_send_s ahead; a holder
+    // that gets it later drops it (with the database away a query waits in the
+    // pool's queue with no error, and runs when it is back). The requester waits
+    // k_relay_answer_s — past the deadline, the holder's own 5 s for the module
+    // and its clock tick — so an answer from any holder that accepted the
+    // command arrives before it gives up; only then does it answer 503 (pg_notify
+    // never returned) or 504. Two cutoffs at one moment would let a holder run a
+    // drain the caller was told did not go.
+    static constexpr int         k_relay_send_s        = 2;
+    static constexpr int         k_relay_answer_s      = k_relay_send_s + k_call_timeout_s + 2;
+    static constexpr std::size_t k_notify_max_bytes    = 7900;   // NOTIFY payload limit is 8000
 
     std::unordered_map<int, std::shared_ptr<Node>> nodes_;          // by fd
     std::map<std::string, std::map<std::string, Instance>> table_;  // module → instance
@@ -396,6 +460,13 @@ private:
     bool          stopping_{false};       // on_stop ran: a LISTEN confirmed during the drain queues nothing
     std::uint64_t mirror_seq_{0};   // mirror_exec calls so far — orders a snapshot against own writes
     std::chrono::system_clock::time_point mirror_sent_{};   // when the outstanding write was sent
+
+    // gateway_cmd
+    bool cmd_listening_{false};                     // LISTEN gateway_cmd confirmed: an answer can reach us
+    std::map<std::string, Relay> relays_;           // requesting side, by command id
+    std::map<std::string, std::chrono::system_clock::time_point> cmd_seen_;   // holder side: accepted ids, until their deadline
+    std::chrono::system_clock::time_point cmd_warned_{};
+    int                                   cmd_quiet_{0};
 };
 
 } // namespace apostol
