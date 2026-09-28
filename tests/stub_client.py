@@ -18,6 +18,13 @@ the second worker) and database access (`--pg "host=127.0.0.1 port=5431 dbname=e
 user=daemon"`, password via PGPASSWORD or `--pg-password-file`); skipped without them. Both
 gateways run with `reload_interval` 5 — the scenario waits for the sweep and the reload after it.
 
+Scenario 12 (a fresh worker) sends SIGHUP to the peer's master (`--peer-master-pid`): the master
+spawns new workers and retires the old ones, and every request through the peer must be 200 or
+503 + `Retry-After` — a fresh worker knows only its own sockets until its first reload, and a miss
+then is not yet a 404. Scenario 13 (`--pg`) kills the listening connections and commits a row in
+the same transaction: its NOTIFY is lost, and the row must appear on the reload the gateway runs
+when LISTEN is confirmed again, well before `reload_interval`. Scenario 11 is reserved for two processes with one identity (T592, 3е).
+
 Gateway configuration for a run: `heartbeat_interval` 2 (scenario 4 waits for suspect/offline by
 the clock), `allowed_cidr` with 127.0.0.0/8, `response_timeout_ms` 2000 (scenario 9 waits for a
 504 after ~2s; at 30000 the echo itself drops the connection after 6s and the gateway correctly
@@ -845,6 +852,129 @@ async def scenario_mirror(gw, tok, peer, pg_dsn):
         pg.close()
 
 
+async def scenario_same_identity(gw, tok):
+    print("11. two processes with one identity (stage 3е, after the node column) — not written yet")
+    print("  [skip] needs gateway.node.node (T592 stage 1)")
+
+
+async def scenario_fresh_worker(gw, tok, peer, peer_master):
+    print("12. fresh worker (SIGHUP of the peer's master): another worker's instance is 503 until the first reload, never 404")
+    if not peer or not peer_master:
+        print("  [skip] needs --peer and --peer-master-pid")
+        return
+    import collections
+    import signal
+
+    def children():
+        try:
+            with open(f"/proc/{peer_master}/task/{peer_master}/children") as f:
+                return set(f.read().split())
+        except OSError:
+            return set()
+
+    hdrs = {"Authorization": f"Bearer {tok}"}
+    echo = Echo(18120)
+    await echo.start()
+    ws = None
+    try:
+        ws = await connect(gw, tok, "fresh", "f1")
+        check((await register(ws, "fresh", "f1", address="127.0.0.1:18120", prefixes=["/api/v2/fresh"]))["t"] == 3, "fresh/f1 registered on my side")
+        deadline = time.time() + 3
+        while time.time() < deadline and listing(peer, tok).get(("fresh", "f1"), {}).get("state") != "ready":
+            await asyncio.sleep(0.1)
+        check(listing(peer, tok).get(("fresh", "f1"), {}).get("state") == "ready", "peer: fresh/f1 ready via NOTIFY")
+        seen = collections.Counter()
+        details = collections.Counter()
+        respawned = 0
+        next_hb = time.time() + HB
+        for _ in range(3):
+            before = children()
+            os.kill(peer_master, signal.SIGHUP)
+            until = time.time() + 5     # longer than a fresh worker needs for its first reload
+            while time.time() < until:
+                if time.time() >= next_hb:
+                    await ws.send(call("/heartbeat", {"in_flight": 0}))
+                    await rx(ws)
+                    next_hb = time.time() + HB
+                try:
+                    r = await asyncio.to_thread(requests.get, f"{peer}/api/v2/fresh/x", headers=hdrs, timeout=5)
+                except requests.RequestException:
+                    seen["dropped"] += 1   # a retiring worker closing an accepted connection — not the gateway's answer
+                    continue
+                seen[r.status_code] += 1
+                if r.status_code != 200:
+                    try:
+                        detail = r.json().get("detail")
+                    except ValueError:
+                        detail = r.text[:60]
+                    details[(r.status_code, r.headers.get("Retry-After"), detail)] += 1
+            if children() - before:
+                respawned += 1
+        print(f"  statuses through the peer across 3 SIGHUPs: {dict(seen)}; non-200: {dict(details)}")
+        check(respawned == 3, f"the peer's master spawned fresh workers on every SIGHUP ({respawned}/3)")
+        check(seen[404] == 0, f"no 404 from a fresh worker ({seen[404]})")
+        check(all(ra == "1" for (st, ra, _), n in details.items() if st == 503), "every 503 carries Retry-After: 1")
+        check(seen[200] > 0, "the instance is served through the peer between the reloads")
+    finally:
+        if ws is not None:
+            try:
+                await ws.send(call("/unregister", {"reason": "done"}))
+                await rx(ws)
+                await close_code(ws)
+            except Exception:
+                pass
+        await echo.stop()
+
+
+async def scenario_listen_lost(gw, tok, pg_dsn):
+    print("13. LISTEN lost: a row whose NOTIFY never reached the listener is found by the reload on re-LISTEN, not a reload_interval later")
+    if not pg_dsn:
+        print("  [skip] needs --pg")
+        return
+    import psycopg2
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+    names = []
+    try:
+        for n in range(3):
+            name = f"lost{n}"
+            names.append(name)
+            c = pg.cursor()
+            c.execute("BEGIN")
+            # No NOTIFY at all where the role may do it (triggers off for this transaction): the
+            # row can then reach the gateway only through a reload, whatever the listener's timing.
+            # Otherwise the listeners are signalled in the same transaction — its NOTIFY goes to
+            # backends on their way out, which a listener reconnecting within milliseconds can beat.
+            c.execute("SAVEPOINT s")
+            try:
+                c.execute("SET LOCAL session_replication_role = replica")
+                silent = True
+            except psycopg2.Error:
+                c.execute("ROLLBACK TO SAVEPOINT s")
+                silent = False
+            c.execute("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity"
+                      " WHERE datname = current_database() AND query ILIKE 'LISTEN%%' AND pid <> pg_backend_pid()")
+            killed = c.fetchone()[0]
+            c.execute("INSERT INTO gateway.node (module, instance, version, address, prefixes, state, capacity, worker)"
+                      " VALUES ('lost', %s, '0', %s, ARRAY[%s], 'ready', 1, NULL)"
+                      " ON CONFLICT (module, instance) DO UPDATE SET state = 'ready', worker = NULL, seen = now()",
+                      (name, f"127.0.0.1:{18180 + n}", f"/api/v2/{name}"))
+            c.execute("COMMIT")
+            check(killed >= 2, f"round {n + 1}: the listeners of both gateways killed ({killed}; NOTIFY {'suppressed' if silent else 'sent'})")
+            t0 = time.time()
+            while time.time() - t0 < RELOAD and listing(gw, tok).get(("lost", name), {}).get("state") != "ready":
+                await asyncio.sleep(0.05)
+            took = time.time() - t0
+            check(listing(gw, tok).get(("lost", name), {}).get("state") == "ready" and took < RELOAD / 2,
+                  f"round {n + 1}: row mirrored after {took:.2f} s (< {RELOAD / 2} s)")
+            pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module = 'lost' AND instance = %s", (name,))
+            await asyncio.sleep(1)
+    finally:
+        if names:
+            pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module = 'lost' AND instance = ANY(%s)", (names,))
+        pg.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -854,6 +984,7 @@ async def main():
     ap.add_argument("--peer", help="second gateway on the same database (scenario 10)")
     ap.add_argument("--pg", help="psycopg2 DSN for reading gateway.node/log (scenario 10)")
     ap.add_argument("--pg-password-file", help="password for --pg (otherwise PGPASSWORD)")
+    ap.add_argument("--peer-master-pid", type=int, help="pid of the peer's master process (scenario 12 sends it SIGHUP)")
     args = ap.parse_args()
     if args.pg and args.pg_password_file:
         args.pg += " password=" + open(args.pg_password_file).read().strip()
@@ -870,7 +1001,10 @@ async def main():
     scenarios = [scenario_register_ok, scenario_register_errors, scenario_auth, scenario_clock,
                  scenario_commands, scenario_replace, scenario_frames, scenario_route,
                  scenario_data_plane,
-                 lambda gw, tok: scenario_mirror(gw, tok, args.peer, args.pg)]
+                 lambda gw, tok: scenario_mirror(gw, tok, args.peer, args.pg),
+                 scenario_same_identity,
+                 lambda gw, tok: scenario_fresh_worker(gw, tok, args.peer, args.peer_master_pid),
+                 lambda gw, tok: scenario_listen_lost(gw, tok, args.pg)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):

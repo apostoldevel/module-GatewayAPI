@@ -398,8 +398,8 @@ void GatewayAPI::do_get(const HttpRequest& req, HttpResponse& resp)
         bool covered = false;
         const auto* inst = pick_instance(path, {}, covered);
         if (!inst) {
-            if (covered) {
-                reply_problem(resp, 503, "no-instance", "Service Unavailable", "route exists, no instance is ready", path);
+            if (covered || !table_loaded_) {
+                reply_problem(resp, 503, "no-instance", "Service Unavailable", miss_detail(covered), path);
                 resp.set_header("Retry-After", "1");
             } else {
                 reply_problem(resp, 404, "no-route", "Not Found", "no prefix covers the path", path);
@@ -1037,8 +1037,13 @@ void GatewayAPI::execute(const HttpRequest& req, std::shared_ptr<HttpConnection>
     bool covered = false;
     auto* inst = pick_instance(req.path, {}, covered);
     if (!inst) {
-        if (covered)
-            answer_problem(conn, ctx, 503, "no-instance", "Service Unavailable", "route exists, no instance is ready", req.path, request_id, /*retry_after=*/true);
+        // Before the first reload the table holds only this worker's own
+        // sockets: a path no prefix covers yet may well be served by an
+        // instance of another worker — a fresh worker (a restart by the
+        // master, SIGHUP) would answer 404 for a second or two. Not yet known
+        // is 503 + Retry-After, the same answer as a route with nothing ready.
+        if (covered || !table_loaded_)
+            answer_problem(conn, ctx, 503, "no-instance", "Service Unavailable", miss_detail(covered), req.path, request_id, /*retry_after=*/true);
         else
             answer_problem(conn, ctx, 404, "no-route", "Not Found", "no prefix covers the path", req.path, request_id);
         return;
@@ -1147,6 +1152,11 @@ void GatewayAPI::answer_problem(const std::shared_ptr<HttpConnection>& conn, con
     if (retry_after) r.set_header("Retry-After", "1");
     apply_refresh_cookies(r, ctx);   // a refresh that happened is not lost on a 5xx
     conn->send_response(r);
+}
+
+std::string_view GatewayAPI::miss_detail(bool covered)
+{
+    return covered ? "route exists, no instance is ready" : "routing table not loaded yet";
 }
 
 // ─── table ───────────────────────────────────────────────────────────────────
@@ -1336,6 +1346,7 @@ void GatewayAPI::on_stop()
     // the shutdown drain (drain_db) counts database queries only, so a
     // forward gets no grace the way an AppServer query does.
     upstreams_.clear();
+    stopping_ = true;
 }
 
 // ─── clock ───────────────────────────────────────────────────────────────────
@@ -1351,10 +1362,32 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
     // listener connection is lost.
     if (!listen_armed_) {
         listen_armed_ = true;
+#ifdef APOSTOL_PG_LISTEN_READY
+        // A NOTIFY committed while the listener was down is lost; the server's
+        // acknowledgement of LISTEN — the first and every re-subscription after
+        // the pool replaced a lost listener — is the moment from which nothing
+        // is lost any more. Re-read then instead of waiting reload_interval.
+        db_.listen("gateway", [this](std::string_view, std::string_view payload) { on_gateway_notify(payload); },
+                   [this](std::string_view) {
+                       if (stopping_) return;   // heartbeat() is latched on stop, this callback is not
+                       log_.notice("GatewayAPI: LISTEN gateway confirmed — reload");
+                       next_reload_ = clock_t_::now() + std::chrono::seconds(reload_interval_);
+                       mirror_reload();
+                   });
+#else
         db_.listen("gateway", [this](std::string_view, std::string_view payload) { on_gateway_notify(payload); });
+#endif
         next_seen_   = now + std::chrono::seconds(heartbeat_interval_);
-        next_reload_ = now + std::chrono::seconds(1);   // first reload right away: a worker that just
-                                                          // came up learns the fleet before its first request
+        // Until the first reload lands a miss is 503, not 404 (table_loaded_).
+        // With the LISTEN hook the first reload is the one on its confirmation
+        // — a snapshot taken after it misses no NOTIFY; the tick is the
+        // fallback. Without it, a second: a snapshot taken before LISTEN is
+        // answered would miss a row committed in between until reload_interval.
+#ifdef APOSTOL_PG_LISTEN_READY
+        next_reload_ = now + std::chrono::seconds(2);
+#else
+        next_reload_ = now + std::chrono::seconds(1);
+#endif
     }
     if (now >= next_seen_)   { next_seen_   = now + std::chrono::seconds(heartbeat_interval_); mirror_seen(now); }
     if (now >= next_reload_) { next_reload_ = now + std::chrono::seconds(reload_interval_);    mirror_reload();  }
@@ -1479,12 +1512,13 @@ void GatewayAPI::mirror_warn(std::string_view what, std::string_view error)
               what, reload_interval_, error);
 }
 
-void GatewayAPI::mirror_exec(std::string sql, std::string what, PgQuery::ResultHandler on_result, std::string kind)
+void GatewayAPI::mirror_exec(std::string sql, std::string what, PgQuery::ResultHandler on_result, std::string kind,
+                             std::function<void()> on_fail)
 {
     ++mirror_seq_;
     if (!kind.empty())
         std::erase_if(mirror_queue_, [&](const MirrorWrite& w) { return w.kind == kind; });
-    mirror_queue_.push_back({std::move(sql), std::move(what), std::move(on_result), std::move(kind)});
+    mirror_queue_.push_back({std::move(sql), std::move(what), std::move(on_result), std::move(kind), std::move(on_fail)});
     if (!mirror_busy_) mirror_next();
 }
 
@@ -1501,15 +1535,16 @@ void GatewayAPI::mirror_next()
     // With the database away this write simply waits; heartbeat() notices
     // the age of mirror_sent_ and says so.
     db_.execute(std::move(w.sql),
-        [this, what, on_result = std::move(w.on_result)](std::vector<PgResult> results) {
+        [this, what, on_result = std::move(w.on_result), on_fail = w.on_fail](std::vector<PgResult> results) {
             if (on_result) {
                 try { on_result(std::move(results)); }
-                catch (const std::exception& e) { mirror_warn(what, e.what()); }
+                catch (const std::exception& e) { mirror_warn(what, e.what()); if (on_fail) on_fail(); }
             }
             mirror_next();
         },
-        [this, what](std::string_view error) {
+        [this, what, on_fail = w.on_fail](std::string_view error) {
             mirror_warn(what, error);
+            if (on_fail) on_fail();
             mirror_next();
         },
         true);   // quiet: seen and sweep are periodic, transitions are logged by set_state
@@ -1614,11 +1649,10 @@ void GatewayAPI::mirror_reload()
     // on it — a state write matches no row another worker holds.
     const std::uint64_t snapshot = mirror_seq_ + 1;   // the seq mirror_exec gives this reload
     mirror_exec(std::move(sql), "sweep+reload", [this, snapshot](std::vector<PgResult> results) {
-        if (results.empty() || results.back().rows() != 1) { mirror_warn("reload", "no result row"); return; }
-        json rows;
-        try { rows = json::parse(results.back().value(0, 0)); }
-        catch (const std::exception& e) { mirror_warn("reload", e.what()); return; }
-        if (!rows.is_array()) { mirror_warn("reload", "not an array"); return; }
+        // A throw here is a failed reload: mirror_next warns and calls on_fail.
+        if (results.empty() || results.back().rows() != 1) throw std::runtime_error("no result row");
+        json rows = json::parse(results.back().value(0, 0));
+        if (!rows.is_array()) throw std::runtime_error("not an array");
 
         const auto now = clock_t_::now();
         std::map<std::string, std::map<std::string, bool>> seen;   // (module, instance) present in the database
@@ -1693,7 +1727,21 @@ void GatewayAPI::mirror_reload()
                     inst.last_heartbeat = now;
                 }
             }
-    }, "reload");
+        if (!table_loaded_) {
+            table_loaded_ = true;
+            log_.notice("GatewayAPI: routing table loaded ({} rows) — a miss is 404 from now on", rows.size());
+        }
+    }, "reload", [this] {
+        // The database answers, and answers every reload with an error (no
+        // schema, no grant, a standby refusing the sweep): the table will not
+        // load by waiting, and a 503 + Retry-After on every mistyped path
+        // would have clients retry a 404 for good. A database that is simply
+        // away does not come here — the pool holds the query until it is back.
+        if (table_loaded_ || ++reload_failures_ < k_reload_failures) return;
+        table_loaded_ = true;
+        log_.warn("GatewayAPI: routing table not loaded after {} failed reloads — a miss is 404, routing own sockets only",
+                  reload_failures_);
+    });
 }
 
 std::string GatewayAPI::mirror_refusal(const json& row) const

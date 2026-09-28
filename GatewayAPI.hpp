@@ -286,8 +286,9 @@ private:
     /// marks a periodic write (seen, reload): a queued one of the same kind
     /// is replaced, not stacked — with the database away the queue would
     /// otherwise grow one per interval and replay the lot on reconnect.
+    /// @p on_fail — the database answered with an error, or @p on_result threw.
     void mirror_exec(std::string sql, std::string what, PgQuery::ResultHandler on_result = {},
-                     std::string kind = {});
+                     std::string kind = {}, std::function<void()> on_fail = {});
     void mirror_next();
     /// Upsert the row from @p inst. @p pre_reason non-empty — first mark the
     /// existing row offline with that reason (register: the previous socket,
@@ -334,6 +335,7 @@ private:
     static bool parse_control_path(std::string_view path, std::string_view control_path,
                                    std::string& module, std::string& instance,
                                    std::string& command);
+    static std::string_view miss_detail(bool covered);
     static bool valid_name(std::string_view s);
     static bool valid_prefix(std::string_view s);
     static bool parse_address(std::string_view address, std::string& host, uint16_t& port);
@@ -377,9 +379,14 @@ private:
     std::chrono::system_clock::time_point mirror_warned_{};
     std::chrono::system_clock::time_point refused_warned_{};   // mirror_refused: once per reload_interval
     int                                   refused_quiet_{0};    // refusals not logged since
-    struct MirrorWrite { std::string sql; std::string what; PgQuery::ResultHandler on_result; std::string kind; };
+    struct MirrorWrite { std::string sql; std::string what; PgQuery::ResultHandler on_result; std::string kind;
+                         std::function<void()> on_fail; };
     std::deque<MirrorWrite> mirror_queue_;
     bool mirror_busy_{false};
+    bool          table_loaded_{false};   // a reload has succeeded (or k_reload_failures failed): a miss is a 404, not a 503
+    static constexpr int k_reload_failures = 3;
+    int           reload_failures_{0};    // answered reloads that failed before the table ever loaded
+    bool          stopping_{false};       // on_stop ran: a LISTEN confirmed during the drain queues nothing
     std::uint64_t mirror_seq_{0};   // mirror_exec calls so far — orders a snapshot against own writes
     std::chrono::system_clock::time_point mirror_sent_{};   // when the outstanding write was sent
 };
