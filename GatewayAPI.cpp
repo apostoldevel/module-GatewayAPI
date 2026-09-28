@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <random>
 
 #include <fmt/format.h>
@@ -96,32 +97,58 @@ GatewayAPI::GatewayAPI(Application& app)
         offline_after_      = cfg->value("offline_after", offline_after_);
         audience_           = cfg->value("audience", audience_);
 
-        if (cfg->contains("allowed_cidr") && (*cfg)["allowed_cidr"].is_array()) {
-            for (const auto& item : (*cfg)["allowed_cidr"]) {
-                if (!item.is_string()) continue;
-                const std::string s = item.get<std::string>();
-                auto slash = s.find('/');
-                std::string ip   = s.substr(0, slash);
-                // No std::stoi: a typo like "10.0.0.0/" or "/xx" would throw
-                // out of the constructor and take the worker down at start.
-                int bits = 32;
-                if (slash != std::string::npos) {
-                    bits = 0;
-                    std::string_view digits = std::string_view(s).substr(slash + 1);
-                    if (digits.empty() || digits.size() > 2) bits = -1;
-                    for (char c : digits) {
-                        if (c < '0' || c > '9') { bits = -1; break; }
-                        bits = bits * 10 + (c - '0');
-                    }
+        // An array, or one string "a.b.c.d/n, e.f.g.h/m" — the form a value
+        // taken from the environment ("${GATEWAY_ALLOWED_CIDR}") arrives in:
+        // substitution happens inside strings only. A blank string is an
+        // absent key: the default [] refuses every registration.
+        std::vector<std::string> entries;
+        if (cfg->contains("allowed_cidr")) {
+            const auto& node = (*cfg)["allowed_cidr"];
+            if (node.is_array()) {
+                for (const auto& item : node) {
+                    if (item.is_string()) entries.push_back(item.get<std::string>());
+                    else log_.warn("GatewayAPI: allowed_cidr entry {} ignored (not a string)", item.dump());
                 }
-                in_addr a{};
-                if (bits < 0 || bits > 32 || ::inet_pton(AF_INET, ip.c_str(), &a) != 1) {
-                    log_.warn("GatewayAPI: allowed_cidr entry '{}' ignored (IPv4 a.b.c.d/n only)", s);
-                    continue;
+            } else if (node.is_string()) {
+                const std::string list = node.get<std::string>();
+                std::size_t from = 0;
+                while (from <= list.size()) {
+                    std::size_t comma = list.find(',', from);
+                    if (comma == std::string::npos) comma = list.size();
+                    std::string_view item = std::string_view(list).substr(from, comma - from);
+                    while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front()))) item.remove_prefix(1);
+                    while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back()))) item.remove_suffix(1);
+                    if (!item.empty()) entries.emplace_back(item);
+                    from = comma + 1;
                 }
-                uint32_t mask = bits == 0 ? 0u : (0xFFFFFFFFu << (32 - bits));
-                allowed_cidr_.push_back({ntohl(a.s_addr) & mask, mask});
+            } else {
+                log_.warn("GatewayAPI: allowed_cidr ignored (an array or a comma-separated string, got {})", node.type_name());
             }
+        }
+        for (const auto& s : entries) {
+            auto slash = s.find('/');
+            std::string ip   = s.substr(0, slash);
+            // No std::stoi: a typo like "10.0.0.0/" or "/xx" would throw
+            // out of the constructor and take the worker down at start.
+            int bits = 32;
+            if (slash != std::string::npos) {
+                bits = 0;
+                std::string_view digits = std::string_view(s).substr(slash + 1);
+                // "/00" would read as /0 and open every address: a typo must
+                // not widen the list, so a two-digit length never starts with 0.
+                if (digits.empty() || digits.size() > 2 || (digits.size() == 2 && digits[0] == '0')) bits = -1;
+                for (char c : digits) {
+                    if (c < '0' || c > '9') { bits = -1; break; }
+                    bits = bits * 10 + (c - '0');
+                }
+            }
+            in_addr a{};
+            if (bits < 0 || bits > 32 || ::inet_pton(AF_INET, ip.c_str(), &a) != 1) {
+                log_.warn("GatewayAPI: allowed_cidr entry '{}' ignored (IPv4 a.b.c.d/n only)", s);
+                continue;
+            }
+            uint32_t mask = bits == 0 ? 0u : (0xFFFFFFFFu << (32 - bits));
+            allowed_cidr_.push_back({ntohl(a.s_addr) & mask, mask});
         }
     }
 

@@ -333,7 +333,7 @@ Section `module.GatewayAPI` of the application's JSON configuration:
 | `connect_timeout_ms` | `1000` | connect to the module |
 | `response_timeout_ms` | `30000` | from sending the request to the last byte of the answer |
 | `reload_interval` | `60` | seconds between re-reads of `gateway.node` and sweeps |
-| `allowed_cidr` | `[]` | IPv4 networks `a.b.c.d/n` an instance may register an `address` in; an empty list refuses every registration with `403` |
+| `allowed_cidr` | `[]` | IPv4 networks `a.b.c.d/n` an instance may register an `address` in; an empty list refuses every registration with `403`. An array, or one comma-separated string — the form a value from the environment takes (`"allowed_cidr": "${GATEWAY_ALLOWED_CIDR}"`, substitution works inside strings only); a blank string is the default. An entry that does not parse — or is not a string, or a value of another type — is skipped with a warning; `/00` does not parse (it would read as `/0`) |
 | `audience` | `service` | the OAuth2 provider (section of `oauth2/*.json`) whose tokens open the control plane |
 
 The worker's identity is not a key of this section: it is the application's `node` (top level of the configuration, e.g. `"node": "${NODE_NAME}"`), else `$NODE_NAME`, else the host name (*Mirror*, **Identity**). Two gateway processes on one database must not share a node name unless they share a PID namespace too. In Kubernetes set `NODE_NAME` from `metadata.name` (the pod), **not** `spec.nodeName` (the machine: two pods on one machine would share it); in docker the container's host name is unique — except with `network_mode: host`, an explicit `hostname:`, or `hostNetwork: true` in Kubernetes, where it is the machine's or a shared one: set `node` explicitly there.
