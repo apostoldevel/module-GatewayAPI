@@ -72,13 +72,14 @@ public:
     bool owns_ws_upgrade(const HttpRequest& req) const;
 
     /// The pre-upgrade filter (Application::set_ws_upgrade_filter): the HTTP
-    /// refusal — 404 unknown control path, 401 token-invalid, 403
-    /// token-expired as problem+json — BEFORE the 101. Returns true to let the
+    /// refusal — 404 unknown control path, 401 token-invalid or token-expired
+    /// as problem+json — BEFORE the 101. Returns true to let the
     /// upgrade through. Called from the filter lambda the application installs
     /// (README § Installation).
     bool ws_upgrade_allowed(const HttpRequest& req, HttpResponse& resp) const;
     /// The one predicate behind both: "" when the handshake may proceed, else
-    /// not-found | bad-request | unauthorized | forbidden (README § Handshake).
+    /// not-found | bad-request | no-credentials | unauthorized | expired
+    /// (README § Handshake).
     std::string handshake_refusal(const HttpRequest& req, std::string& module, std::string& instance) const;
 
     /// Called from the application's ws_handler lambda, after the 101. The
@@ -125,8 +126,9 @@ protected:
 
     /// Every refusal AppServer produces itself — check_auth synchronously, the
     /// refresh callback asynchronously — as the gateway's problem+json (README
-    /// § Errors): invalid → 401 token-invalid, expired / refresh_failed /
-    /// database-401 → 401 token-expired, the rest by status.
+    /// § Errors): invalid → 401 token-invalid, expired / database-401 → 401
+    /// token-expired, the rest by status (refresh_failed is no longer produced
+    /// by AppServer — T307 — and still maps to token-expired for overrides).
     void reply_refused(HttpResponse& resp, const Refusal& refusal) override;
 
 private:
@@ -182,14 +184,25 @@ private:
                         std::string_view request_id, bool retry_after = false) const;
 
     /// Verify the Bearer against the gateway audience. Returns "" when ok,
-    /// otherwise a short reason ("unauthorized" / "forbidden").
+    /// otherwise a short reason: "no-credentials" (no Bearer at all),
+    /// "unauthorized" (not a valid token of this audience — an expired token of
+    /// another audience included), "expired" (this audience's, expired).
     std::string check_gateway_token(const HttpRequest& req) const;
     /// problem+json (RFC 9457) the gateway's way: type urn:apostol:gateway:<slug>,
-    /// code null, X-Request-Id — minted here unless @p request_id is given
-    /// (the data plane has one already: the one the module saw).
+    /// X-Request-Id — minted here unless @p request_id is given (the data plane
+    /// has one already: the one the module saw). Every 401 also gets the
+    /// challenge and a catalogue code (see the body); @p no_credentials marks a
+    /// request that carried no Bearer at all.
     void reply_problem(HttpResponse& resp, int status, std::string_view slug,
                        std::string_view title, std::string_view detail,
-                       std::string_view instance_path, std::string_view request_id = {}) const;
+                       std::string_view instance_path, std::string_view request_id = {},
+                       bool no_credentials = false) const;
+
+    /// WWW-Authenticate for a 401 the gateway produces itself (RFC 6750 §3):
+    /// a bare `Bearer` when the request carried no credentials (§3.1),
+    /// otherwise Bearer error="invalid_token", with error_description only when
+    /// @p detail is within the §3 alphabet — the go-platform host's rule.
+    static void set_challenge(HttpResponse& resp, std::string_view detail, bool no_credentials);
 
     // ── WebSocket ──────────────────────────────────────────────────────────
 

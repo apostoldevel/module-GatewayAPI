@@ -3,6 +3,7 @@
 #include "GatewayAPI.hpp"
 
 #include "apostol/application.hpp"
+#include "apostol/base64.hpp"
 #include "apostol/event_loop.hpp"
 #include "apostol/http.hpp"
 #include "apostol/http_utils.hpp"
@@ -256,11 +257,38 @@ std::string GatewayAPI::new_uuid()
 
 // ─── token ───────────────────────────────────────────────────────────────────
 
+// The aud claim of a token whose signature verify_jwt has already checked —
+// read from the payload, which verify_jwt does not hand back on expiry.
+static std::string token_audience(std::string_view token)
+{
+    const auto first = token.find('.');
+    const auto second = first == std::string_view::npos ? first : token.find('.', first + 1);
+    if (second == std::string_view::npos)
+        return {};
+
+    std::string b64(token.substr(first + 1, second - first - 1));
+    std::replace(b64.begin(), b64.end(), '-', '+');
+    std::replace(b64.begin(), b64.end(), '_', '/');
+    while (b64.size() % 4)
+        b64 += '=';
+
+    try {
+        const auto payload = json::parse(base64_decode(b64));
+        const auto it = payload.find("aud");
+        if (it != payload.end() && it->is_string())
+            return it->get<std::string>();
+    } catch (const std::exception&) {
+    }
+    return {};
+}
+
 std::string GatewayAPI::check_gateway_token(const HttpRequest& req) const
 {
+    // Nothing to check is its own answer: RFC 6750 §3.1 wants a bare challenge
+    // for a request that carried no credentials, not invalid_token.
     auto auth = parse_authorization(req.header("Authorization"));
     if (auth.schema != Authorization::Schema::bearer || auth.token.empty())
-        return "unauthorized";
+        return "no-credentials";
     try {
         auto claims = verify_jwt(auth.token, providers_);
         // verify_jwt found SOME provider by aud and checked the signature with
@@ -271,7 +299,16 @@ std::string GatewayAPI::check_gateway_token(const HttpRequest& req) const
             return "unauthorized";
         return {};
     } catch (const JwtExpiredError&) {
-        return "forbidden";
+        // Expired — but whose? verify_jwt checks the signature before the
+        // expiry (measured: an expired token with a wrong signature is
+        // "invalid"), so the aud read here is authentic. A token of another
+        // audience gets the answer a valid one of another audience gets:
+        // saying "expired" to it tells the caller it holds a genuinely signed
+        // token, which the control plane has no business confirming.
+        const auto* app = providers_.find_default(audience_);
+        if (!app || token_audience(auth.token) != app->client_id)
+            return "unauthorized";
+        return "expired";
     } catch (const std::exception&) {
         // JwtVerificationError — and anything else verify_jwt lets out on a
         // string that is not a token at all (base64 "too much fill" from a
@@ -282,9 +319,33 @@ std::string GatewayAPI::check_gateway_token(const HttpRequest& req) const
 
 void GatewayAPI::reply_problem(HttpResponse& resp, int status, std::string_view slug,
                                std::string_view title, std::string_view detail,
-                               std::string_view instance_path, std::string_view request_id) const
+                               std::string_view instance_path, std::string_view request_id,
+                               bool no_credentials) const
 {
     const std::string rid = request_id.empty() ? new_uuid() : std::string(request_id);
+
+    // Every 401 the gateway answers itself — the data plane's refusals of
+    // check_auth and the control plane's of check_gateway_token alike — is
+    // decided here, so no new call site can forget either half (T282):
+    //
+    //   - RFC 6750 §3: a bearer resource's 401 carries the challenge. The host
+    //     behind the gateway sets its own; these are answered before a request
+    //     ever reaches it.
+    //   - The catalogue id the go-platform host gives the same case, so one case
+    //     reads one code whichever producer refused it (T243, owner's word 2а).
+    //     Every way a token fails to verify is one code: ERR-401-007 "signature
+    //     is incorrect" would tell a prober which check it passed.
+    //
+    // A request with no credentials at all gets the bare challenge (§3.1) and
+    // the host's code for the same case, ERR-401-001.
+    //
+    // Other statuses keep code null: the gateway has no catalogue id for them.
+    std::string_view code;
+    if (status == 401) {
+        set_challenge(resp, detail, no_credentials);
+        code = slug == "token-expired" ? "ERR-401-008" : "ERR-401-001";
+    }
+
     json body = {
         {"type",       fmt::format("urn:apostol:gateway:{}", slug)},
         {"title",      title},
@@ -292,7 +353,7 @@ void GatewayAPI::reply_problem(HttpResponse& resp, int status, std::string_view 
         {"detail",     detail},
         {"instance",   instance_path},
         {"request_id", rid},
-        {"code",       nullptr},
+        {"code",       code.empty() ? json(nullptr) : json(code)},
     };
     resp.set_status(status, std::string(title));
     resp.set_header("X-Request-Id", rid);
@@ -311,10 +372,16 @@ void GatewayAPI::do_get(const HttpRequest& req, HttpResponse& resp)
         return;
     }
     if (auto why = check_gateway_token(req); !why.empty()) {
-        reply_problem(resp, why == "forbidden" ? 403 : 401,
-                      why == "forbidden" ? "token-expired" : "token-invalid",
-                      why == "forbidden" ? "Forbidden" : "Unauthorized",
-                      "gateway audience token required", req.path);
+        // 401 for an expired token too (RFC 6750 §3.1: invalid_token covers
+        // "expired"); it was 403. The gateway client answers every 4xx of the
+        // handshake the same way — a slow retry with a fresh token.
+        reply_problem(resp, 401,
+                      why == "expired" ? "token-expired" : "token-invalid",
+                      "Unauthorized",
+                      why == "expired" ? "gateway audience token expired"
+                                       : "gateway audience token required",
+                      req.path, {},
+                      /*no_credentials=*/why == "no-credentials");
         return;
     }
     if (command == "route") {
@@ -370,10 +437,16 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
         return;
     }
     if (auto why = check_gateway_token(req); !why.empty()) {
-        reply_problem(resp, why == "forbidden" ? 403 : 401,
-                      why == "forbidden" ? "token-expired" : "token-invalid",
-                      why == "forbidden" ? "Forbidden" : "Unauthorized",
-                      "gateway audience token required", req.path);
+        // 401 for an expired token too (RFC 6750 §3.1: invalid_token covers
+        // "expired"); it was 403. The gateway client answers every 4xx of the
+        // handshake the same way — a slow retry with a fresh token.
+        reply_problem(resp, 401,
+                      why == "expired" ? "token-expired" : "token-invalid",
+                      "Unauthorized",
+                      why == "expired" ? "gateway audience token expired"
+                                       : "gateway audience token required",
+                      req.path, {},
+                      /*no_credentials=*/why == "no-credentials");
         return;
     }
 
@@ -417,7 +490,7 @@ std::string GatewayAPI::handshake_refusal(const HttpRequest& req, std::string& m
         return "not-found";
     if (!valid_name(module) || !valid_name(instance))
         return "bad-request";
-    return check_gateway_token(req);   // "" | "unauthorized" | "forbidden"
+    return check_gateway_token(req);   // "" | "no-credentials" | "unauthorized" | "expired"
 }
 
 bool GatewayAPI::ws_upgrade_allowed(const HttpRequest& req, HttpResponse& resp) const
@@ -432,10 +505,11 @@ bool GatewayAPI::ws_upgrade_allowed(const HttpRequest& req, HttpResponse& resp) 
         reply_problem(resp, 404, "not-found", "Not Found", "unknown control path", req.path);
     else if (refuse == "bad-request")
         reply_problem(resp, 400, "bad-request", "Bad Request", "module and instance: ^[a-z0-9][a-z0-9_-]{0,62}$", req.path);
-    else if (refuse == "forbidden")
-        reply_problem(resp, 403, "token-expired", "Forbidden", "gateway audience token expired", req.path);
+    else if (refuse == "expired")
+        reply_problem(resp, 401, "token-expired", "Unauthorized", "gateway audience token expired", req.path);
     else
-        reply_problem(resp, 401, "token-invalid", "Unauthorized", "gateway audience token required", req.path);
+        reply_problem(resp, 401, "token-invalid", "Unauthorized", "gateway audience token required", req.path, {},
+                      /*no_credentials=*/refuse == "no-credentials");
     log_.warn("GatewayAPI: upgrade {} from {} refused before 101 ({})", req.path, get_real_ip(req), refuse);
     return false;
 }
@@ -897,6 +971,30 @@ void GatewayAPI::data_plane(const HttpRequest& req, HttpResponse& resp, std::str
         reply_problem(resp, 400, "bad-request", "Bad Request", "request refused before routing", req.path);
 }
 
+void GatewayAPI::set_challenge(HttpResponse& resp, std::string_view detail, bool no_credentials)
+{
+    if (no_credentials) {
+        resp.set_header("WWW-Authenticate", "Bearer");
+        return;
+    }
+
+    // RFC 6750 §3: error_description is %x20-21 / %x23-5B / %x5D-7E — printable
+    // ASCII without the quote and the backslash. Escaping would put a backslash
+    // in, which the grammar forbids too, so a detail outside the alphabet (a
+    // localised message, a quote) is left out rather than mangled; the body
+    // carries it anyway. The same choice as the go-platform host, so both 401s
+    // of /api/v2 read alike.
+    const bool describable = !detail.empty() &&
+        std::all_of(detail.begin(), detail.end(), [](unsigned char c) {
+            return c >= 0x20 && c <= 0x7E && c != '"' && c != '\\';
+        });
+
+    resp.set_header("WWW-Authenticate",
+                    describable
+                        ? fmt::format(R"(Bearer error="invalid_token", error_description="{}")", detail)
+                        : std::string(R"(Bearer error="invalid_token")"));
+}
+
 void GatewayAPI::reply_refused(HttpResponse& resp, const Refusal& refusal)
 {
     using Kind = Refusal::Kind;
@@ -919,6 +1017,7 @@ void GatewayAPI::reply_refused(HttpResponse& resp, const Refusal& refusal)
             break;
         case Kind::internal:       slug = "internal";      title = "Internal Server Error"; break;
     }
+
     reply_problem(resp, status, slug, title, refusal.message, refusal.path);
 }
 

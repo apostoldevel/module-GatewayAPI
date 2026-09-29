@@ -58,7 +58,7 @@ Upgrade: websocket
 | `404` | `not-found` | путь не `{control_path}/{module}/{instance}` |
 | `400` | `bad-request` | сегмент не по шаблону |
 | `401` | `token-invalid` | нет токена, плохая подпись, не тот `aud` / `iss` |
-| `403` | `token-expired` | токен просрочен |
+| `401` | `token-expired` | истёк токен аудитории шлюза (до T307 — 403); истёкший токен чужой аудитории — `token-invalid` |
 
 (На фреймворке без фильтра до апгрейда тот же отказ приходит как `close 1008` с причиной в close-кадре — модуль переживает оба одинаково.)
 
@@ -225,9 +225,9 @@ module ──► instance ──► { address, prefixes[], state, capacity,
 | Статус | Slug | Когда | Заголовки |
 |--------|------|-------|-----------|
 | `400` | `bad-request` | отказ до маршрутизации (значения `result_object` / `result_format`, преобразователь тела) | |
-| `401` | `token-invalid` | подпись, `aud`, `iss` | |
-| `401` | `token-expired` | токен доступа просрочен, обновление невозможно (RFC 6750 §3.1) | |
-| `403` | `token-expired` | просроченный **сервисный** токен шлюза на рукопожатии плоскости управления | |
+| `401` | `token-invalid` — `code` `ERR-401-001` | нет токена (плоскость управления), подпись, `aud`, `iss`, не токен | `WWW-Authenticate: Bearer error="invalid_token"` |
+| `401` | `token-expired` — `code` `ERR-401-008` | токен доступа просрочен, обновление невозможно (RFC 6750 §3.1) | `WWW-Authenticate: Bearer error="invalid_token"` |
+| `401` | `token-expired` — `code` `ERR-401-008` | просроченный токен аудитории шлюза на плоскости управления (до T307 — 403); просроченный токен **чужой** аудитории получает `token-invalid`, как годный чужой | `WWW-Authenticate: Bearer error="invalid_token"` |
 | `404` | `no-route` | ни один префикс не покрывает путь | |
 | `405` | `method-not-allowed` | `PUT` / `PATCH` / `DELETE` на управляющий путь | `Allow: GET, POST` |
 | `409` | `not-on-this-worker` | команда экземпляру, сокет которого держит другой воркер | |
@@ -235,6 +235,8 @@ module ──► instance ──► { address, prefixes[], state, capacity,
 | `503` | `no-instance` | маршрут есть, ни одного `ready` | `Retry-After: 1` |
 | `504` | `upstream-timeout` | нет полного ответа за `response_timeout_ms`; команда не отвечена за 5 с | |
 | прочие | `refresh-refused`, `internal` | база отклонила обновление токена не 401-м статусом; внутренняя ошибка | |
+
+`code` — `null`, кроме `401`: там код каталога, который хост go-platform даёт тому же случаю; всякий непроверенный токен — `ERR-401-001` (отдельный код «плохая подпись» подсказал бы перебирающему, какую проверку он прошёл). Каждый `401` несёт `WWW-Authenticate` (RFC 6750 §3): голый `Bearer`, если учётных данных нет вовсе (нет `Authorization`, чужая схема, пустой токен — §3.1; плоскость данных такой запрос сама не отвергает, он уходит к хосту), иначе `Bearer error="invalid_token"`, `error_description` — только если `detail` в алфавите §3 (печатный ASCII без `"` и `\`), как у хоста.
 
 Модуль отвечает в той же форме с `type = urn:apostol:error:<код>` и заполненным `code`; такие ответы шлюз пропускает без изменений.
 
@@ -339,7 +341,7 @@ if (app.module_enabled("AppServer") && app.has_db_pool())
 // …
 app.set_ws_upgrade_filter([gateway_raw](const HttpRequest& req, HttpResponse& resp) {
     if (gateway_raw && gateway_raw->owns_ws_upgrade(req))
-        return gateway_raw->ws_upgrade_allowed(req, resp);   // 404/400/401/403 до 101
+        return gateway_raw->ws_upgrade_allowed(req, resp);   // 404/400/401 до 101
     return true;
 });
 app.set_ws_handler([ws_api_raw, gateway_raw](EventLoop& loop, WsConnection ws, const HttpRequest& req) {
