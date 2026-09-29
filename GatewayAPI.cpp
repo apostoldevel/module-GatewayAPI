@@ -1396,10 +1396,14 @@ void GatewayAPI::mirror_next()
     auto w = std::move(mirror_queue_.front());
     mirror_queue_.pop_front();
     auto what = w.what;
-    // The pool queues a query while no connection is ready and re-queues one
-    // cut off by a connection error — on_exception is for an SQL error only.
-    // With the database away this write simply waits; heartbeat() notices
-    // the age of mirror_sent_ and says so.
+    // The pool queues a query while no connection is ready, and with
+    // PgRetry::if_lost sends one cut off by a lost connection again (T627) —
+    // every mirror write is an upsert or a state set that ends in the same
+    // state the second time (a register's repeat journals one extra
+    // offline -> ready, as before T627); on_exception is then for an SQL
+    // error only. With the database
+    // away this write simply waits; heartbeat() notices the age of
+    // mirror_sent_ and says so.
     db_.execute(std::move(w.sql),
         [this, what, on_result = std::move(w.on_result)](std::vector<PgResult> results) {
             if (on_result) {
@@ -1412,7 +1416,8 @@ void GatewayAPI::mirror_next()
             mirror_warn(what, error);
             mirror_next();
         },
-        true);   // quiet: seen and sweep are periodic, transitions are logged by set_state
+        true,    // quiet: seen and sweep are periodic, transitions are logged by set_state
+        PgRetry::if_lost);
 }
 
 void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason, std::string_view reason, bool reassert)
