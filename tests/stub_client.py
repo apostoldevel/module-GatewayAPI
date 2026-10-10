@@ -34,6 +34,11 @@ Scenario 15 (`--peer`, `--pg`) sends commands through the peer to an instance wh
 they are relayed over NOTIFY `gateway_cmd`, signed with a key of the audience secret; forged, replayed and late
 messages must not reach the module. With `--pg-container` it pauses the database's docker container for about ten
 seconds: the relay must answer 503, and the command that reaches the channel after the database is back must not run.
+Scenario 16 (`--peer`, `--pg` as a role that may signal the gateways' backends, `--pg-container`,
+`--peer-master-pid`) cuts connections off with a statement in the server's hands (`pg_terminate_backend`;
+`docker exec kill -STOP/-CONT` holds the pool's backends so the command is caught in flight): a relayed
+`pg_notify` and a fresh worker's first reloads must be sent again (`PgRetry::if_lost`) — 200 from the module, not
+503, and 503 `routes-loading`, not 404. Run on a gateway whose pool does not repeat them, both turn red.
 
 Gateway configuration for a run: `heartbeat_interval` 2 (scenario 4 waits for suspect/offline by
 the clock), `allowed_cidr` with 127.0.0.0/8, `response_timeout_ms` 2000 (scenario 9 waits for a
@@ -307,6 +312,14 @@ async def scenario_commands(gw, tok):
     check(a == "/reload" and r.status_code == 502 and r.json()["type"] == "urn:apostol:gateway:upstream-error",
           f"module CALLERROR → HTTP 502 problem+json ({r.json().get('detail')})")
 
+    # A malformed CALLERROR from the module: the HTTP caller still gets its answer.
+    fut = loop.run_in_executor(None, lambda: requests.post(f"{gw}/gateway/clients/k1/ping", headers=hdr, timeout=8))
+    while (m := await rx(ws, timeout=10))["t"] != 2:
+        pass
+    await ws.send(json.dumps({"t": 4, "u": m["u"], "c": "x", "m": 7}))
+    r = await fut
+    check(r.status_code == 502, f"CALLERROR with c/m of another type → HTTP {r.status_code}, socket lives")
+
     fut = loop.run_in_executor(None, lambda: requests.post(f"{gw}/gateway/clients/k1/ping", headers=hdr, timeout=12))
     a = await module_side(answer_ping=False)
     t0 = time.monotonic()
@@ -350,12 +363,23 @@ async def scenario_replace(gw, tok):
 
 
 async def scenario_frames(gw, tok):
-    print("7. frames: binary → 1003, > 64 KiB → 1009, not JSON → 400, repeated u → 400")
+    print("7. frames: binary → 1003, > 64 KiB → 1009, not JSON / wrong type / too deep → 400, repeated u → 400")
     ws = await connect(gw, tok, "clients", "f1")
     await register(ws, "clients", "f1")
     await ws.send("not json")
     r = await rx(ws)
     check(r["t"] == 4 and r["c"] == 400, "not JSON → 400")
+    # Fields of another type and deep nesting: answered 400, the socket (and the worker under it) lives.
+    for what, raw in [
+        ("t a string", json.dumps({"t": "x", "u": "w1"})),
+        ("t null", json.dumps({"t": None, "u": "w2"})),
+        ("a a number", json.dumps({"t": 2, "u": "w3", "a": 5, "p": {}})),
+        ("state a number", call("/status", {"state": 5}, u="w4")),
+        ("nested 30000 deep", '{"t":2,"u":"w5","a":"/heartbeat","p":{"x":' + "[" * 30000 + "]" * 30000 + "}}"),
+    ]:
+        await ws.send(raw)
+        r = await rx(ws)
+        check(r["t"] == 4 and r["c"] == 400, f"{what} → 400 ({r.get('m')})")
     u = str(uuid.uuid4())
     # A duplicate u "in flight" can't be caught from outside (the response arrives before the
     # second frame) — we only check that a normal repeat of u after the response is accepted.
@@ -1399,6 +1423,169 @@ async def scenario_commands_relayed(gw, tok, peer, pg_dsn, pg_container):
         spy.close()
 
 
+async def scenario_statement_lost(gw, tok, peer, pg_dsn, pg_container, peer_master):
+    print("16. connection lost with the statement in the server's hands: the pool sends it again (PgRetry::if_lost, T768)")
+    if not peer or not pg_dsn or not pg_container or not peer_master:
+        print("  [skip] needs --peer, --pg, --pg-container and --peer-master-pid")
+        return
+    import collections
+    import signal
+    import subprocess
+    import psycopg2
+    hdrs = {"Authorization": f"Bearer {tok}"}
+    loop = asyncio.get_event_loop()
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+
+    def in_container(*cmd):
+        # Through sh: its builtin kill, the image need not carry procps.
+        subprocess.run(["docker", "exec", pg_container, "sh", "-c", " ".join(cmd)], check=True, capture_output=True)
+
+    def pool_backends():
+        # Every pool connection of the gateways, listeners excepted: a client port seen through
+        # docker-proxy names no process, so all of them are taken — what this checks does not
+        # depend on whose they are.
+        c = pg.cursor()
+        c.execute("SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                  " AND usename = (SELECT usename FROM pg_stat_activity WHERE query ILIKE 'LISTEN%%' LIMIT 1)"
+                  " AND query NOT ILIKE 'LISTEN%%' AND backend_type = 'client backend'")
+        return [str(r[0]) for r in c.fetchall()]
+
+    def children():
+        try:
+            with open(f"/proc/{peer_master}/task/{peer_master}/children") as f:
+                return set(f.read().split())
+        except OSError:
+            return set()
+
+    def is_worker(pid):
+        # The master respawns its helper too; only a worker reloads the routing table.
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return b"worker" in f.read()
+        except OSError:
+            return False
+
+    ws = await connect(gw, tok, "lost16", "l1")
+    echo = Echo(18160)
+    await echo.start()
+    next_hb = time.time() + HB
+
+    async def keep_alive():
+        nonlocal next_hb
+        if time.time() >= next_hb:
+            await ws.send(call("/heartbeat", {"in_flight": 0}))
+            next_hb = time.time() + HB
+
+    try:
+        check((await register(ws, "lost16", "l1", address="127.0.0.1:18160", prefixes=["/api/v2/lost16"]))["t"] == 3,
+              "lost16/l1 registered on this gateway")
+        t0 = time.time()
+        while time.time() - t0 < RELOAD and listing(peer, tok).get(("lost16", "l1"), {}).get("state") != "ready":
+            await asyncio.sleep(0.05)
+        check(listing(peer, tok).get(("lost16", "l1"), {}).get("state") == "ready", "lost16/l1 mirrored by the peer")
+
+        # (a) A relayed command whose pg_notify is cut off in the server's hands. The pool connections
+        # are stopped, the command goes out through the peer into one of them, and the backends are
+        # then terminated: the statement was sent whole, and the connection is lost before an answer.
+        # Sent again (if_lost), it reaches the holder and the module answers: 200. Reported instead
+        # (PgRetry::never), the peer answers 503 "the database refused the command" at once.
+        stopped = pool_backends()
+        in_container("kill", "-STOP", *stopped)
+        sent = time.monotonic()
+        try:
+            fut = loop.run_in_executor(None, lambda: requests.post(f"{peer}/gateway/lost16/l1/ping", headers=hdrs, timeout=12))
+            await asyncio.sleep(0.5)
+            pg.cursor().execute("SELECT count(pg_terminate_backend(p::int)) FROM unnest(%s::text[]) p", (stopped,))
+        finally:
+            in_container("kill", "-CONT", *stopped)
+        answered = None
+        end = time.monotonic() + 10
+        while not fut.done() and time.monotonic() < end:
+            try:
+                m = await rx(ws, timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            if m.get("t") == 2 and m.get("a") == "/ping":
+                answered = m["a"]
+                await ws.send(json.dumps({"t": 3, "u": m["u"], "p": {"in_flight": 16}}))
+        r = await fut
+        took = time.monotonic() - sent
+        # Not before the backends were let go: an answer sooner went out on a connection
+        # pool_backends() missed, and nothing was cut off.
+        check(took >= 0.5, f"the command was caught in flight: answered after {took:.2f} s, not before the backends were let go")
+        check(r.status_code == 200 and answered == "/ping",
+              f"pg_notify lost with the connection ({len(stopped)} backends): sent again, the module answered — HTTP {r.status_code} {r.text[:120]}")
+
+        # (b) A fresh worker whose first reloads are cut off. The table is locked, so every reload
+        # waits in the server; the fresh worker's is terminated three times. Sent again (if_lost),
+        # the worker keeps answering 503 routes-loading and serves once the lock is gone. Counted as
+        # failed reloads instead, the third sets "loaded" without a table and a legal path is 404.
+        lock = psycopg2.connect(pg_dsn)
+        lc = lock.cursor()
+        seen = collections.Counter()
+        kills = collections.Counter()   # per fresh pid: with several workers, 3 in all would be fewer than 3 each
+        try:
+            lc.execute("BEGIN")
+            lc.execute("LOCK TABLE gateway.node IN EXCLUSIVE MODE")
+            before = children()
+            os.kill(peer_master, signal.SIGHUP)
+            fresh = set()
+            end = time.time() + 15
+            while time.time() < end and not (fresh and all(kills[p] >= 3 for p in fresh)):
+                await keep_alive()
+                fresh = fresh or {p for p in children() - before if is_worker(p)}
+                if fresh:
+                    for p in fresh:
+                        c = pg.cursor()
+                        c.execute("SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE %s",
+                                  (f"%swept by worker %:{p}: seen older%",))
+                        for (pid,) in c.fetchall():
+                            pg.cursor().execute("SELECT pg_terminate_backend(%s)", (pid,))
+                            kills[p] += 1
+                try:
+                    rr = await asyncio.to_thread(requests.get, f"{peer}/api/v2/lost16/x", headers=hdrs, timeout=5)
+                    seen[(rr.status_code, rr.json().get("type", "").rsplit(":", 1)[-1] if rr.status_code != 200 else "")] += 1
+                except (requests.RequestException, ValueError):
+                    seen["dropped"] += 1
+                await asyncio.sleep(0.1)
+            t1 = time.time()
+            while time.time() - t1 < 1.5:
+                await keep_alive()
+                try:
+                    rr = await asyncio.to_thread(requests.get, f"{peer}/api/v2/lost16/x", headers=hdrs, timeout=5)
+                    seen[(rr.status_code, rr.json().get("type", "").rsplit(":", 1)[-1] if rr.status_code != 200 else "")] += 1
+                except (requests.RequestException, ValueError):
+                    seen["dropped"] += 1
+                await asyncio.sleep(0.1)
+        finally:
+            lock.rollback()
+            lock.close()
+        served = False
+        t2 = time.time()
+        while time.time() - t2 < 5 and not served:
+            await keep_alive()
+            rr = await asyncio.to_thread(requests.get, f"{peer}/api/v2/lost16/x", headers=hdrs, timeout=5)
+            served = rr.status_code == 200
+            await asyncio.sleep(0.1)
+        print(f"  statuses through the peer while its fresh worker's reloads were cut off: {dict(seen)}")
+        check(fresh and all(kills[p] >= 3 for p in fresh),
+              f"every fresh worker's reload cut off in the server's hands 3 times or more ({dict(kills)})")
+        check(not [k for k in seen if k != "dropped" and k[0] == 404], "no 404 from the fresh worker while its reloads were lost")
+        check(all(k[1] == "routes-loading" for k in seen if k != "dropped" and k[0] == 503) and
+              any(k != "dropped" and k[0] == 503 for k in seen), "every 503 meanwhile is routes-loading")
+        check(served, f"served through the peer once the lock is gone (HTTP {rr.status_code})")
+    finally:
+        try:
+            await ws.send(call("/unregister", {"reason": "done"}))
+            await close_code(ws)
+        except Exception:
+            pass
+        await echo.stop()
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module = 'lost16'")
+        pg.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -1431,7 +1618,9 @@ async def main():
                  lambda gw, tok: scenario_fresh_worker(gw, tok, args.peer, args.peer_master_pid),
                  lambda gw, tok: scenario_listen_lost(gw, tok, args.pg),
                  lambda gw, tok: scenario_prefix_handoff(gw, tok, args.pg),
-                 lambda gw, tok: scenario_commands_relayed(gw, tok, args.peer, args.pg, args.pg_container)]
+                 lambda gw, tok: scenario_commands_relayed(gw, tok, args.peer, args.pg, args.pg_container),
+                 lambda gw, tok: scenario_statement_lost(gw, tok, args.peer, args.pg, args.pg_container,
+                                                         args.peer_master_pid)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):

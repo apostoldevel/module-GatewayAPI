@@ -52,6 +52,33 @@ int int_or(const nlohmann::json& o, const char* key, int def)
     return it != o.end() && it->is_number_integer() ? it->get<int>() : def;
 }
 
+// The same for a string. A frame's fields are read through these two, not
+// json::value(): value() throws on a field of another type, and a frame is
+// handled in the socket's epoll callback, where an exception that escapes
+// ends the worker (T644).
+std::string str_or(const nlohmann::json& o, const char* key, std::string def)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_string() ? it->get<std::string>() : std::move(def);
+}
+
+// Deepest nesting accepted in JSON from a module or a control-plane caller.
+// nlohmann parses without recursion but copies and serialises recursively:
+// a frame nested deep enough overflows the worker's stack even under the
+// 64 KiB frame limit (measured: ~11k levels on a debug build). That is a
+// signal, not an exception — no catch sees it. The protocol nests a few
+// levels; 128 is far above them.
+constexpr int k_max_json_depth = 128;
+
+json parse_bounded(const std::string& text)
+{
+    return json::parse(text, [](int depth, json::parse_event_t, json&) {
+        if (depth > k_max_json_depth)
+            throw std::out_of_range("JSON nested deeper than allowed");
+        return true;
+    });
+}
+
 // gateway.node.node is nullable: NULL (a binary that does not write it), or
 // absent from an older trigger's payload — both read as "".
 std::string node_of(const nlohmann::json& o)
@@ -504,7 +531,8 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
 
     json p = json::object();
     if (!req.body.empty()) {
-        p = json::parse(req.body, nullptr, false);
+        try { p = parse_bounded(req.body); }
+        catch (const std::exception&) { p = nullptr; }
         if (!p.is_object()) {
             reply_problem(resp, 400, "bad-request", "Bad Request", "body must be a JSON object", req.path);
             return;
@@ -751,41 +779,70 @@ void GatewayAPI::on_ws_message(const std::shared_ptr<Node>& node, uint8_t opcode
         return;
     }
 
-    json msg = json::parse(payload, nullptr, false);
+    // This runs in the socket's epoll callback, outside the HTTP dispatcher's
+    // try: an exception that leaves it ends the worker process, every node
+    // and every HTTP call in flight on it (T644). Fields are read by type
+    // (int_or/str_or), and whatever still throws below is answered, not
+    // propagated. A catch does not cover a stack overflow: the depth is
+    // bounded at parse, and p is moved out, not copied.
+    json msg;
+    try { msg = parse_bounded(payload); }
+    catch (const std::out_of_range&) {
+        log_.warn("GatewayAPI: {}/{} from {}: frame nested deeper than {} refused", node->module,
+                  node->instance, node->peer_ip, k_max_json_depth);
+        send_call_error(*node->ws, "", 400, fmt::format("frame nested deeper than {}", k_max_json_depth));
+        return;
+    }
+    catch (const std::exception&) { msg = nullptr; }
     if (!msg.is_object()) {
         send_call_error(*node->ws, "", 400, "frame is not a JSON object");
         return;
     }
-    const int t = msg.value("t", -1);
-    std::string u;
-    if (msg.contains("u") && msg["u"].is_string()) u = msg["u"].get<std::string>();
+    const int t = int_or(msg, "t", -1);
+    const std::string u = str_or(msg, "u", "");
 
-    switch (t) {
-        case 2: {
-            if (u.empty()) { send_call_error(*node->ws, "", 400, "missing u"); return; }
-            // "duplicate u in flight" cannot happen here: every CALL is
-            // answered synchronously inside this callback, so nothing from
-            // the module is ever in flight when the next frame is parsed.
-            std::string action = msg.value("a", "");
-            json p = msg.contains("p") ? msg["p"] : json::object();
-            if (!p.is_object()) {
-                send_call_error(*node->ws, u, 400, "p must be an object");
+    try {
+        switch (t) {
+            case 2: {
+                if (u.empty()) { send_call_error(*node->ws, "", 400, "missing u"); return; }
+                // "duplicate u in flight" cannot happen here: every CALL is
+                // answered synchronously inside this callback, so nothing from
+                // the module is ever in flight when the next frame is parsed.
+                auto a = msg.find("a");
+                if (a == msg.end() || !a->is_string()) {
+                    send_call_error(*node->ws, u, 400, "missing or non-string a");
+                    return;
+                }
+                const std::string action = a->get<std::string>();
+                json p = json::object();
+                if (auto it = msg.find("p"); it != msg.end()) p = std::move(*it);
+                if (!p.is_object()) {
+                    send_call_error(*node->ws, u, 400, "p must be an object");
+                    return;
+                }
+                on_call(node, u, action, p);
                 return;
             }
-            on_call(node, u, action, p);
-            return;
+            case 3:
+            case 4:
+                on_reply(node, msg);
+                return;
+            case 0:
+            case 1:
+                send_call_error(*node->ws, u, 400, "OPEN/CLOSE are not used on the control plane");
+                return;
+            default:
+                send_call_error(*node->ws, u, 400, "unknown message type");
+                return;
         }
-        case 3:
-        case 4:
-            on_reply(node, msg);
-            return;
-        case 0:
-        case 1:
-            send_call_error(*node->ws, u, 400, "OPEN/CLOSE are not used on the control plane");
-            return;
-        default:
-            send_call_error(*node->ws, u, 400, "unknown message type");
-            return;
+    } catch (const json::exception& e) {
+        log_.warn("GatewayAPI: {}/{} from {}: frame refused: {}", node->module, node->instance,
+                  node->peer_ip, e.what());
+        if (!node->closing) send_call_error(*node->ws, u, 400, "invalid message");
+    } catch (const std::exception& e) {
+        log_.error("GatewayAPI: {}/{} from {}: frame failed: {}", node->module, node->instance,
+                   node->peer_ip, e.what());
+        if (!node->closing) send_call_error(*node->ws, u, 500, "internal error");
     }
 }
 
@@ -805,7 +862,7 @@ void GatewayAPI::on_call(const std::shared_ptr<Node>& node, const std::string& u
 
 void GatewayAPI::on_reply(const std::shared_ptr<Node>& node, const json& msg)
 {
-    std::string u = msg.value("u", "");
+    const std::string u = str_or(msg, "u", "");
     auto it = node->pending.find(u);
     if (it == node->pending.end()) {
         log_.debug("GatewayAPI: {}/{}: reply to unknown u={}", node->module, node->instance, u);
@@ -814,18 +871,31 @@ void GatewayAPI::on_reply(const std::shared_ptr<Node>& node, const json& msg)
     PendingCall call = std::move(it->second);
     node->pending.erase(it);
 
-    const int t = msg.value("t", -1);
+    const int t = int_or(msg, "t", -1);
     log_.debug("GatewayAPI: {}/{}: {} answered ({}) in {} ms", node->module, node->instance,
                call.action, t == 3 ? "result" : "error",
                std::chrono::duration_cast<std::chrono::milliseconds>(clock_t_::now() - call.sent).count());
 
-    if (call.answer) {
-        if (t == 3)
-            call.answer({200, msg.contains("p") ? msg["p"] : json::object(), {}, {}, {}});
-        else
-            call.answer({502, {}, "upstream-error", "Bad Gateway",
-                         fmt::format("module answered {} with {}: {}", call.action,
-                                     msg.value("c", 0), msg.value("m", ""))});
+    if (!call.answer) return;
+    // The call is already out of pending: whatever happens below, the caller
+    // is answered here or never — nothing else will find it (T644). Fields
+    // are read by type: c/m of another type must not throw past the answer.
+    Answer a;
+    if (t == 3) {
+        auto p = msg.find("p");
+        a = {200, p != msg.end() ? *p : json::object(), {}, {}, {}};
+    } else {
+        a = {502, {}, "upstream-error", "Bad Gateway",
+             fmt::format("module answered {} with {}: {}", call.action,
+                         int_or(msg, "c", 0), str_or(msg, "m", ""))};
+    }
+    try {
+        call.answer(a);
+    } catch (const std::exception& e) {
+        log_.warn("GatewayAPI: {}/{}: reply to {} refused: {}", node->module, node->instance,
+                  call.action, e.what());
+        call.answer({502, {}, "upstream-error", "Bad Gateway",
+                     fmt::format("module answered {} with a malformed reply", call.action)});
     }
 }
 
@@ -1000,7 +1070,11 @@ void GatewayAPI::handle_heartbeat(const std::shared_ptr<Node>& node, const std::
 
 void GatewayAPI::handle_status(const std::shared_ptr<Node>& node, const std::string& u, const json& p)
 {
-    const std::string state = p.value("state", "");
+    if (!p.contains("state") || !p["state"].is_string()) {
+        send_call_error(*node->ws, u, 400, "missing or non-string state");
+        return;
+    }
+    const std::string state = p["state"].get<std::string>();
     if (state != "ready" && state != "draining" && state != "overloaded") {
         send_call_error(*node->ws, u, 422, "state must be ready|draining|overloaded");
         return;
@@ -1021,7 +1095,7 @@ void GatewayAPI::handle_status(const std::shared_ptr<Node>& node, const std::str
 
 void GatewayAPI::handle_unregister(const std::shared_ptr<Node>& node, const std::string& u, const json& p)
 {
-    const std::string reason = p.value("reason", "");
+    const std::string reason = str_or(p, "reason", "");
     if (auto* inst = find_instance(node->module, node->instance))
         set_state(*inst, "offline", fmt::format("unregister: {}", reason));
     send_call_result(*node->ws, u, json::object());
@@ -1498,7 +1572,7 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
 
     // Relayed commands not answered within k_relay_answer_s. Any answer that
     // came before wins, whether pg_notify has returned or not: its result can
-    // be lost with the connection (the pool re-queues the statement) after the
+    // be lost with the connection (the pool sends it again, PgRetry::if_lost) after the
     // command was committed and run.
     for (auto it = relays_.begin(); it != relays_.end();) {
         if (now - it->second.sent < std::chrono::seconds(k_relay_answer_s)) { ++it; continue; }
@@ -1509,7 +1583,11 @@ void GatewayAPI::heartbeat(clock_t_::time_point now)
         if (unsent) {
             log_.warn("GatewayAPI: {}: not relayed — pg_notify has not returned in {} s", what, k_relay_answer_s);
             respond(conn, {503, {}, "database-unavailable", "Service Unavailable",
-                           fmt::format("the database did not take the command in {} s", k_relay_answer_s)});
+                           // Not "did not take": with PgRetry::if_lost a first send may
+                           // have committed before the connection went, and its holder's
+                           // answer may have gone with the database. Only this is known.
+                           fmt::format("the database did not confirm the command in {} s, and no worker holding the socket answered",
+                                       k_relay_answer_s)});
         } else {
             log_.warn("GatewayAPI: {}: relayed, no worker holding the socket answered in {} s", what, k_relay_answer_s);
             respond(conn, {504, {}, "upstream-timeout", "Gateway Timeout",
@@ -1652,24 +1730,45 @@ void GatewayAPI::mirror_next()
     auto w = std::move(mirror_queue_.front());
     mirror_queue_.pop_front();
     auto what = w.what;
-    // The pool queues a query while no connection is ready and re-queues one
-    // cut off by a connection error — on_exception is for an SQL error only.
-    // With the database away this write simply waits; heartbeat() notices
-    // the age of mirror_sent_ and says so.
-    db_.execute(std::move(w.sql),
-        [this, what, on_result = std::move(w.on_result), on_fail = w.on_fail](std::vector<PgResult> results) {
-            if (on_result) {
-                try { on_result(std::move(results)); }
-                catch (const std::exception& e) { mirror_warn(what, e.what()); if (on_fail) on_fail(); }
-            }
-            mirror_next();
-        },
-        [this, what, on_fail = w.on_fail](std::string_view error) {
-            mirror_warn(what, error);
-            if (on_fail) on_fail();
-            mirror_next();
-        },
-        true);   // quiet: seen and sweep are periodic, transitions are logged by set_state
+    // The pool queues a query while no connection is ready, and with
+    // PgRetry::if_lost sends one cut off by a lost connection again (T627) —
+    // every mirror write is an upsert, a state set or a read that ends in the
+    // same state the second time (a register's repeat journals one extra
+    // offline -> ready, as before T627); on_exception is then for an SQL
+    // error only. With the database
+    // away this write simply waits; heartbeat() notices the age of
+    // mirror_sent_ and says so.
+    //
+    // execute() itself can throw (epoll registration of a reconnect). The
+    // write goes back to the head of the queue and the queue is released —
+    // the next mirror_exec() retries it; on_fail is not called, the write is
+    // not lost. Left busy, the mirror would stop for
+    // the life of the worker: this used to be moot while any throw on a
+    // frame ended the worker, and is not since the frame handler catches (T644).
+    // A throw after the pool has taken the query (add_io/modify_io failing
+    // on ENOMEM and the like) would send this write twice; that is for
+    // PgPool::execute to rule out, not for this queue.
+    try {
+        db_.execute(w.sql,
+            [this, what, on_result = w.on_result, on_fail = w.on_fail](std::vector<PgResult> results) {
+                if (on_result) {
+                    try { on_result(std::move(results)); }
+                    catch (const std::exception& e) { mirror_warn(what, e.what()); if (on_fail) on_fail(); }
+                }
+                mirror_next();
+            },
+            [this, what, on_fail = w.on_fail](std::string_view error) {
+                mirror_warn(what, error);
+                if (on_fail) on_fail();
+                mirror_next();
+            },
+            true,    // quiet: seen and sweep are periodic, transitions are logged by set_state
+            PgRetry::if_lost);
+    } catch (const std::exception& e) {
+        mirror_warn(what, e.what());
+        mirror_queue_.push_front(std::move(w));
+        mirror_busy_ = false;
+    }
 }
 
 void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason, std::string_view reason, bool reassert)
@@ -2082,7 +2181,7 @@ void GatewayAPI::on_gateway_notify(std::string_view payload)
 
 void GatewayAPI::on_gateway_notify_(std::string_view payload)
 {
-    json msg = json::parse(payload);
+    json msg = parse_bounded(std::string(payload));
     if (!msg.is_object()) return;
 
     const std::string module   = msg.value("module", "");
@@ -2254,10 +2353,23 @@ void GatewayAPI::cmd_notify(std::string payload, std::function<void()> on_sent,
 {
     // Not through mirror_exec: nothing orders a command against the mirror,
     // and a queue stalled behind the database would hold it past its deadline.
-    db_.execute(fmt::format("SELECT pg_notify('gateway_cmd', {})", pq_quote_literal(payload)),
-        [on_sent = std::move(on_sent)](std::vector<PgResult>) { if (on_sent) on_sent(); },
-        [on_fail = std::move(on_fail)](std::string_view error) { if (on_fail) on_fail(error); },
-        /*quiet=*/true);
+    // PgRetry::if_lost (T627, T768): a pg_notify cut off by a lost connection
+    // may have committed — the holder may already have run the command. It is
+    // sent again rather than reported: the holder drops a repeat by its id
+    // (cmd_seen_) and a late one by its deadline, the requester takes the
+    // first answer by id. on_fail is then for an SQL error only, when nothing
+    // was committed.
+    // execute() itself can throw (epoll registration of a reconnect): that is
+    // on_fail too — close_node and drop_node answer their pending calls in a
+    // loop, and a throw out of one cmd_answer would leave the rest unanswered.
+    try {
+        db_.execute(fmt::format("SELECT pg_notify('gateway_cmd', {})", pq_quote_literal(payload)),
+            [on_sent](std::vector<PgResult>) { if (on_sent) on_sent(); },
+            [on_fail](std::string_view error) { if (on_fail) on_fail(error); },
+            /*quiet=*/true, PgRetry::if_lost);
+    } catch (const std::exception& e) {
+        if (on_fail) on_fail(e.what());
+    }
 }
 
 void GatewayAPI::relay_command(const std::string& module, const std::string& instance, const std::string& command,
@@ -2290,8 +2402,8 @@ void GatewayAPI::relay_command(const std::string& module, const std::string& ins
         [this, id]() { if (auto it = relays_.find(id); it != relays_.end()) it->second.notified = true; },
         [this, id](std::string_view error) {
             // An SQL error: the statement did not commit, nothing reached the
-            // channel. (A lost connection is not reported here — the pool
-            // re-queues the statement.)
+            // channel. (A lost connection is not reported here — cmd_notify
+            // asks the pool to send the statement again, PgRetry::if_lost.)
             auto it = relays_.find(id);
             if (it == relays_.end()) return;
             auto conn = std::move(it->second.http_conn);
@@ -2351,7 +2463,7 @@ void GatewayAPI::on_cmd_notify_(std::string_view payload)
     const std::string_view text = payload.substr(mac_len + 1);
     if (!same_mac(payload.substr(0, mac_len), hmac_sha256_hex(key, text))) { cmd_refused("bad signature"); return; }
 
-    const json msg = json::parse(text);
+    const json msg = parse_bounded(std::string(text));
     if (!msg.is_object()) { cmd_refused("not an object"); return; }
     const std::string kind = msg.value("k", "");
     const std::string id   = msg.value("id", "");
@@ -2398,7 +2510,10 @@ void GatewayAPI::on_cmd_notify_(std::string_view payload)
         return;
     }
     if (!cmd_seen_.emplace(id, clock_t_::time_point(std::chrono::milliseconds(due))).second) {
-        cmd_refused(fmt::format("{}/{} {} from worker {}: replayed id {}", module, instance, command, from, id));
+        // A replay — or the pool sending a pg_notify again after a lost
+        // connection (PgRetry::if_lost in cmd_notify): the same message twice.
+        cmd_refused(fmt::format("{}/{} {} from worker {}: id {} seen already (a replay, or a repeat after a lost connection)",
+                                module, instance, command, from, id));
         return;
     }
     log_.notice("GatewayAPI: {}/{}: {} relayed by worker {}", module, instance, command, from);
