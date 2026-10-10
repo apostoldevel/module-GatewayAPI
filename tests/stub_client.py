@@ -288,6 +288,14 @@ async def scenario_commands(gw, tok):
     check(a == "/reload" and r.status_code == 502 and r.json()["type"] == "urn:apostol:gateway:upstream-error",
           f"module CALLERROR → HTTP 502 problem+json ({r.json().get('detail')})")
 
+    # A malformed CALLERROR from the module: the HTTP caller still gets its answer.
+    fut = loop.run_in_executor(None, lambda: requests.post(f"{gw}/gateway/clients/k1/ping", headers=hdr, timeout=8))
+    while (m := await rx(ws, timeout=10))["t"] != 2:
+        pass
+    await ws.send(json.dumps({"t": 4, "u": m["u"], "c": "x", "m": 7}))
+    r = await fut
+    check(r.status_code == 502, f"CALLERROR with c/m of another type → HTTP {r.status_code}, socket lives")
+
     fut = loop.run_in_executor(None, lambda: requests.post(f"{gw}/gateway/clients/k1/ping", headers=hdr, timeout=12))
     a = await module_side(answer_ping=False)
     t0 = time.monotonic()
@@ -328,12 +336,23 @@ async def scenario_replace(gw, tok):
 
 
 async def scenario_frames(gw, tok):
-    print("7. frames: binary → 1003, > 64 KiB → 1009, not JSON → 400, repeated u → 400")
+    print("7. frames: binary → 1003, > 64 KiB → 1009, not JSON / wrong type / too deep → 400, repeated u → 400")
     ws = await connect(gw, tok, "clients", "f1")
     await register(ws, "clients", "f1")
     await ws.send("not json")
     r = await rx(ws)
     check(r["t"] == 4 and r["c"] == 400, "not JSON → 400")
+    # Fields of another type and deep nesting: answered 400, the socket (and the worker under it) lives.
+    for what, raw in [
+        ("t a string", json.dumps({"t": "x", "u": "w1"})),
+        ("t null", json.dumps({"t": None, "u": "w2"})),
+        ("a a number", json.dumps({"t": 2, "u": "w3", "a": 5, "p": {}})),
+        ("state a number", call("/status", {"state": 5}, u="w4")),
+        ("nested 30000 deep", '{"t":2,"u":"w5","a":"/heartbeat","p":{"x":' + "[" * 30000 + "]" * 30000 + "}}"),
+    ]:
+        await ws.send(raw)
+        r = await rx(ws)
+        check(r["t"] == 4 and r["c"] == 400, f"{what} → 400 ({r.get('m')})")
     u = str(uuid.uuid4())
     # A duplicate u "in flight" can't be caught from outside (the response arrives before the
     # second frame) — we only check that a normal repeat of u after the response is accepted.
