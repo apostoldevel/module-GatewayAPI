@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <random>
+#include <tuple>
 
 #include <fmt/format.h>
 
@@ -42,6 +44,22 @@ bool prefixes_overlap(std::string_view a, std::string_view b)
     if (a == b) return true;
     if (a.size() < b.size()) std::swap(a, b);
     return a.substr(0, b.size()) == b && a[b.size()] == '/';
+}
+
+// The refusal of `prefixes` of `module` by the prefixes held by the OTHER
+// modules of `claims` (module → prefixes), the /register 409 text; empty —
+// none overlaps.
+std::string held_by(const std::map<std::string, std::vector<std::string>>& claims, const std::string& module,
+                    const std::vector<std::string>& prefixes)
+{
+    for (const auto& [mod, theirs] : claims) {
+        if (mod == module) continue;
+        for (const auto& t : theirs)
+            for (const auto& mine : prefixes)
+                if (prefixes_overlap(t, mine))
+                    return fmt::format("prefix {} belongs to module {}", mine, mod);
+    }
+    return {};
 }
 
 // json::value() throws on a key whose value is null; gateway.node.worker is
@@ -701,7 +719,11 @@ void GatewayAPI::close_node(const std::shared_ptr<Node>& node, uint16_t code, st
 {
     if (node->closing) return;
     node->closing = true;
-    node->ws->send_close(code, reason);
+    // A control frame carries at most 125 bytes (RFC 6455 §5.5): two of the
+    // code, 123 of the reason. A longer one — a long prefix in "prefix …
+    // belongs to module …" — would be a protocol error, not the refusal.
+    // The reasons are ASCII (names and prefixes by their patterns).
+    node->ws->send_close(code, reason.substr(0, 123));
     // Any HTTP caller waiting on this node gets 502 now.
     auto pending = std::move(node->pending);
     node->pending.clear();
@@ -964,6 +986,21 @@ void GatewayAPI::handle_register(const std::shared_ptr<Node>& node, const std::s
     if (host != node->peer_ip)
         log_.warn("GatewayAPI: {}/{}: address {} differs from socket peer {} (allowed)",
                   node->module, node->instance, host, node->peer_ip);
+
+    // Until the first reload this worker knows only its own sockets: a prefix
+    // of another module registered on another worker would pass the check
+    // below and stay here for good (T769). Not a refusal of the module —
+    // no CALLERROR; close 1013 sends it to the common back-off (K2, K6), and
+    // the table is loaded by the time it comes back (about a second).
+    // A database still away after k_register_wait_s: the registration is
+    // taken as before — the first reload settles a prefix held elsewhere —
+    // so the worker routes its own sockets while it cannot read the table.
+    if (!table_loaded_ && seconds_since(born_, clock_t_::now()) < k_register_wait_s) {
+        log_.notice("GatewayAPI: {}/{} from {}: /register before the routing table is loaded — close 1013",
+                    node->module, node->instance, node->peer_ip);
+        close_node(node, 1013, "routing table loading");
+        return;
+    }
 
     // 409 — a prefix owned by ANOTHER module
     for (const auto& [mod, insts] : table_) {
@@ -1866,7 +1903,8 @@ void GatewayAPI::mirror_reload()
         " WHERE state <> 'offline' AND (node, worker) IS DISTINCT FROM ({}, {}) AND seen < now() - make_interval(secs => {});\n"
         "SELECT coalesce(json_agg(n), '[]'::json)::text FROM (\n"
         "  SELECT module, instance, version, address, prefixes, state, capacity, worker, node,\n"
-        "         extract(epoch FROM now() - seen)::int AS seen_s, extract(epoch FROM now() - registered)::int AS registered_s\n"
+        "         extract(epoch FROM now() - seen)::int AS seen_s, extract(epoch FROM now() - registered)::int AS registered_s,\n"
+        "         (extract(epoch FROM registered) * 1000000)::bigint AS registered_us\n"
         "    FROM gateway.node WHERE state <> 'offline') n;",
         pq_quote_literal(fmt::format("swept by worker {}: seen older than {} s", self_, stale_s)),
         pq_quote_literal(node_), pid_, stale_s);
@@ -1889,44 +1927,101 @@ void GatewayAPI::mirror_reload()
         const auto now = clock_t_::now();
         std::map<std::string, std::map<std::string, bool>> seen;   // (module, instance) present in the database
 
-        // Who holds which prefix, as of this snapshot: an instance live in the
-        // table AND in the snapshot holds the prefixes it has in both
-        // (established — a newcomer overlapping one is refused, not the other
-        // way round); this worker's own sockets hold theirs (the truth,
-        // whatever the snapshot says). An instance the snapshot shows gone, or
-        // a prefix its row no longer carries, holds nothing any more: it may
-        // have been handed over. A prefix a row added, and every foreign row
-        // admitted below, is claimed in loop order, so of two overlapping
-        // newcomers only the first is taken. mirror_refusal checks
-        // cross-module overlap against this for the length of the loop.
-        std::map<std::string, std::vector<std::string>> claims;
+        // Who holds which prefix, as of this snapshot — the same answer on
+        // every worker (T769). Candidates: every live row of the snapshot —
+        // an own socket's current row stands for the socket and is judged on
+        // the row, as every other worker judges it — and the own sockets the
+        // snapshot does not show yet (no row, a row older than our /register,
+        // another worker's row), in place of their rows and after all of
+        // them: an upsert still queued behind the reload is registered after
+        // every row the snapshot holds. In the order of
+        // `registered` — the database's clock, one for all workers; ties by
+        // module, then instance — a candidate holds its prefixes unless one
+        // overlaps a prefix already held by ANOTHER module: the earlier
+        // registration keeps it, whichever worker holds which socket. An
+        // instance the snapshot shows gone, or a prefix its row no longer
+        // carries, holds nothing: it may have been handed over. A row failing
+        // the other /register checks holds nothing either. mirror_refusal
+        // checks cross-module overlap against `claims` while they are built
+        // and for the length of the loop below. An own socket that holds
+        // nothing is closed 1008 — the module waits as after a 409 and gets
+        // the 409 when it comes back.
+        struct Candidate {
+            std::int64_t registered_us;
+            std::string  module;
+            std::string  instance;
+            const json*  row;        // a snapshot row; nullptr — an own socket ahead of its row
+            Instance*    own;        // the own socket behind it; nullptr — no socket here
+        };
+        constexpr std::int64_t k_unordered = std::numeric_limits<std::int64_t>::max();
+        std::vector<Candidate> candidates;
+        std::map<std::string, std::map<std::string, const json*>> row_of;
         for (const auto& row : rows) {
             if (!row.is_object() || !row.contains("module") || !row["module"].is_string() ||
                 !row.contains("instance") || !row["instance"].is_string()) continue;
-            const auto module = row["module"].get<std::string>();
-            const auto* known = find_instance(module, row["instance"].get<std::string>());
-            if (!known || known->state == "offline" || !row.contains("prefixes") || !row["prefixes"].is_array())
-                continue;
-            for (const auto& p : known->prefixes)
-                if (std::find(row["prefixes"].begin(), row["prefixes"].end(), p) != row["prefixes"].end())
-                    claims[module].push_back(p);
+            row_of[row["module"].get<std::string>()][row["instance"].get<std::string>()] = &row;
         }
-        for (const auto& [mod, insts] : table_)
-            for (const auto& [name, inst] : insts)
-                if (owns(inst) && socket_of(mod, name))
-                    claims[mod].insert(claims[mod].end(), inst.prefixes.begin(), inst.prefixes.end());
-        // mirror_apply also returns true for a refused row that only takes a
-        // state: that one claims nothing.
-        const auto claim = [this, &claims](const json& row) {
-            if (!mirror_refusal(row).empty()) return;
-            auto& to = claims[row["module"].get<std::string>()];
-            for (const auto& p : row["prefixes"]) to.push_back(p.get<std::string>());
+        const auto registered_us = [](const json& row) {
+            auto it = row.find("registered_us");
+            return it != row.end() && it->is_number_integer() ? it->get<std::int64_t>() : k_unordered;
         };
+        // The snapshot predates our own /register queued behind the reload:
+        // the row's `registered` is then older than ours (as in the loop).
+        const auto stale = [&now](const json& row, const Instance& inst) {
+            return row.contains("registered_s") && row["registered_s"].is_number() &&
+                   now - std::chrono::seconds(row["registered_s"].get<int>()) < inst.registered - std::chrono::seconds(1);
+        };
+        std::map<std::string, std::map<std::string, Instance*>> own_row;   // own sockets with a current row
+        for (auto& [mod, insts] : table_)
+            for (auto& [name, inst] : insts) {
+                if (!owns(inst) || !socket_of(mod, name)) continue;
+                const json* row = row_of.count(mod) && row_of[mod].count(name) ? row_of[mod][name] : nullptr;
+                if (row && row_is_me(*row) && !stale(*row, inst)) own_row[mod][name] = &inst;
+                else candidates.push_back({k_unordered, mod, name, nullptr, &inst});
+            }
+        for (const auto& [mod, insts] : row_of)
+            for (const auto& [name, row] : insts) {
+                Instance* own = own_row.count(mod) && own_row[mod].count(name) ? own_row[mod][name] : nullptr;
+                candidates.push_back({registered_us(*row), mod, name, row, own});
+            }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            return std::tie(a.registered_us, a.module, a.instance) < std::tie(b.registered_us, b.module, b.instance);
+        });
+
+        std::map<std::string, std::vector<std::string>> claims;
         struct ClaimsScope {
             const std::map<std::string, std::vector<std::string>>*& slot;
             ~ClaimsScope() { slot = nullptr; }
         } claims_scope{reload_claims_};
         reload_claims_ = &claims;
+        std::vector<std::pair<Instance*, std::string>> lost;
+        for (const auto& c : candidates) {
+            auto& to = claims[c.module];
+            if (!c.row) {
+                if (auto why = held_by(claims, c.module, c.own->prefixes); !why.empty())
+                    lost.emplace_back(c.own, std::move(why));
+                else
+                    to.insert(to.end(), c.own->prefixes.begin(), c.own->prefixes.end());
+            } else if (mirror_refusal(*c.row).empty()) {
+                for (const auto& p : (*c.row)["prefixes"]) to.push_back(p.get<std::string>());
+            } else if (c.own && (*c.row)["prefixes"].is_array()) {
+                // Refused on the row: the socket goes only for a prefix of
+                // another module — a refusal of another kind (a hand on the
+                // row) leaves it to the re-assert below.
+                std::vector<std::string> theirs;
+                for (const auto& p : (*c.row)["prefixes"])
+                    if (p.is_string()) theirs.push_back(p.get<std::string>());
+                if (auto why = held_by(claims, c.module, theirs); !why.empty()) lost.emplace_back(c.own, std::move(why));
+            }
+        }
+        for (auto& [inst, why] : lost) {
+            // Written before the close, as every close this worker starts:
+            // drop_node leaves a closing node's row alone.
+            log_.warn("GatewayAPI: {}/{}: {}, registered earlier — closing 1008", inst->module, inst->instance, why);
+            auto node = socket_of(inst->module, inst->instance);
+            set_state(*inst, "offline", why);
+            if (node) close_node(node, 1008, why);
+        }
         for (const auto& row : rows) {
             if (!row.is_object() || !row.contains("module") || !row.contains("instance")) continue;
             const std::string module = row["module"].get<std::string>();
@@ -1950,7 +2045,6 @@ void GatewayAPI::mirror_reload()
                     if (mirror_admissible(row, "reload")) {
                         take_over(module, instance, row_identity(row));
                         mirror_apply(row, "reload");
-                        claim(row);
                     }
                 } else {
                     const bool same_route = row.value("address", "") == mine->address &&
@@ -1975,7 +2069,10 @@ void GatewayAPI::mirror_reload()
                 // socket closed while the database was away. Close it in the
                 // database. A row with our pid alone is not ours — another
                 // pod's worker with the same pid, or a binary that writes no
-                // node — and is mirrored below like any foreign row.
+                // node — and is mirrored below like any foreign row. An
+                // offline of ours queued behind the snapshot (a socket closed
+                // a moment ago, one that lost its prefix above) settles it.
+                if (mine && owns(*mine) && mine->state == "offline" && mine->written > snapshot) continue;
                 Instance gone;
                 gone.module = module; gone.instance = instance; gone.state = "offline";
                 mirror_state(gone, "no socket on worker");
@@ -1984,8 +2081,7 @@ void GatewayAPI::mirror_reload()
             }
             // A row the database holds but this worker refuses to route to
             // counts as absent: a mirror of it goes offline below.
-            if (mirror_apply(row, "reload")) claim(row);
-            else seen[module].erase(instance);
+            if (!mirror_apply(row, "reload")) seen[module].erase(instance);
         }
 
         for (auto& [mod, insts] : table_)
@@ -2063,11 +2159,7 @@ std::string GatewayAPI::mirror_refusal(const json& row) const
         // gone (its NOTIFY lost) — checked against it, the new owner of a
         // handed-over prefix would be refused and the path left on the old
         // one for a whole reload_interval.
-        for (const auto& [mod, theirs] : *reload_claims_) {
-            if (mod == module) continue;
-            if (auto why = taken(mod, theirs); !why.empty()) return why;
-        }
-        return {};
+        return held_by(*reload_claims_, module, prefixes);
     }
     for (const auto& [mod, insts] : table_) {
         if (mod == module) continue;

@@ -474,16 +474,21 @@ private:
     std::chrono::system_clock::time_point mirror_warned_{};
     std::chrono::system_clock::time_point refused_warned_{};   // mirror_refused: once per reload_interval
     int                                   refused_quiet_{0};    // refusals not logged since
-    // Set for the length of a reload's reconcile loop: module -> the prefixes
-    // its live rows in the snapshot and this worker's own sockets claim. The
-    // cross-module check of mirror_refusal runs against it instead of table_,
-    // which still holds instances the same snapshot shows gone.
+    // Set for the length of a reload's reconcile: module -> the prefixes its
+    // live rows in the snapshot and this worker's own sockets hold, taken in
+    // the order of `registered` (T769). The cross-module check of
+    // mirror_refusal runs against it instead of table_, which still holds
+    // instances the same snapshot shows gone.
     const std::map<std::string, std::vector<std::string>>* reload_claims_{nullptr};
     struct MirrorWrite { std::string sql; std::string what; PgQuery::ResultHandler on_result; std::string kind;
                          std::function<void()> on_fail; };
     std::deque<MirrorWrite> mirror_queue_;
     bool mirror_busy_{false};
     bool          table_loaded_{false};   // a reload has succeeded (or k_reload_failures failed): a miss is a 404, not a 503
+    // When this worker started: /register waits for the first reload (close
+    // 1013) no longer than k_register_wait_s after it (T769).
+    std::chrono::system_clock::time_point born_{std::chrono::system_clock::now()};
+    static constexpr int k_register_wait_s = 10;
     static constexpr int k_reload_failures = 3;
     int           reload_failures_{0};    // answered reloads that failed before the table ever loaded
     bool          stopping_{false};       // on_stop ran: a LISTEN confirmed during the drain queues nothing

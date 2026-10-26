@@ -39,6 +39,13 @@ Scenario 16 (`--peer`, `--pg` as a role that may signal the gateways' backends, 
 `docker exec kill -STOP/-CONT` holds the pool's backends so the command is caught in flight): a relayed
 `pg_notify` and a fresh worker's first reloads must be sent again (`PgRetry::if_lost`) — 200 from the module, not
 503, and 503 `routes-loading`, not 404. Run on a gateway whose pool does not repeat them, both turn red.
+Scenario 17 (`--peer`, `--peer-master-pid`) registers, right after each SIGHUP of the peer's master, a module
+whose prefix nests in one this gateway holds: the fresh worker closes the /register `1013` without a CALLERROR
+until its first reload and refuses it `409` after — never accepts it (T769). Scenario 18 (`--peer`, `--pg`,
+`--pg-container`) pauses the database and registers two modules with overlapping prefixes, one on each gateway:
+both are accepted, and after the reloads the one registered first (`gateway.node.registered`, ties by module)
+keeps the prefix on both gateways while the other is closed `1008`. On a gateway that checks /register against
+its own sockets only, or keeps "own sockets win" in the reload, both turn red.
 
 Gateway configuration for a run: `heartbeat_interval` 2 (scenario 4 waits for suspect/offline by
 the clock), `allowed_cidr` with 127.0.0.0/8, `response_timeout_ms` 2000 (scenario 9 waits for a
@@ -205,6 +212,14 @@ async def scenario_register_errors(gw, tok):
     r = await rx(ws2)
     cc, _ = await close_code(ws2)
     check(r["t"] == 4 and r["c"] == 409 and cc == 1008, f"→ 409 + close {cc}")
+    # A close frame carries at most 123 bytes of reason (RFC 6455 §5.5): a longer one is a protocol error, and
+    # the module would read a lost connection instead of the refusal (T769).
+    ws2 = await connect(gw, tok, "other", "o1")
+    await ws2.send(call("/register", register_payload("other", "o1", prefixes=["/api/v2/clients/" + "v" * 120])))
+    r = await rx(ws2)
+    cc, why = await close_code(ws2)
+    check(r["t"] == 4 and r["c"] == 409 and cc == 1008 and len(why.encode()) <= 123,
+          f"a reason longer than a close frame takes → 409 + close {cc}, reason cut to {len(why.encode())} bytes")
 
     print("   CALL before /register → 409, socket alive; /register not within 5s → close 1008")
     ws3 = await connect(gw, tok, "clients", "c3")
@@ -1586,6 +1601,171 @@ async def scenario_statement_lost(gw, tok, peer, pg_dsn, pg_container, peer_mast
         pg.close()
 
 
+class Holder:
+    """A registered socket kept alive by heartbeats; `closed` is (code, reason) once the gateway ends it."""
+    def __init__(self, ws):
+        self.ws, self.closed = ws, None
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        try:
+            while True:
+                await self.ws.send(call("/heartbeat", {"in_flight": 0}))
+                until = time.monotonic() + HB
+                while time.monotonic() < until:   # answers and the gateway's CALLs
+                    try:
+                        m = json.loads(await asyncio.wait_for(self.ws.recv(), until - time.monotonic()))
+                    except asyncio.TimeoutError:
+                        break
+                    if m.get("t") == 2:
+                        await self.ws.send(json.dumps({"t": 3, "u": m["u"], "p": {}}))
+        except websockets.ConnectionClosed as e:
+            self.closed = (e.rcvd.code if e.rcvd else None, e.rcvd.reason if e.rcvd else "")
+
+    async def stop(self):
+        self.task.cancel()
+        if self.closed is None:
+            try:
+                await self.ws.send(call("/unregister", {"reason": "done"}))
+                await close_code(self.ws, 2)
+            except Exception:
+                pass
+
+
+async def register_outcome(gw, tok, module, instance, **over):
+    """("result", ws) | ("error", code, message, close code) | ("closed", code, reason) — the last with no frame."""
+    ws = await connect(gw, tok, module, instance)
+    await ws.send(call("/register", register_payload(module, instance, **over)))
+    try:
+        m = await rx(ws)
+    except websockets.ConnectionClosed as e:
+        return ("closed", e.rcvd.code if e.rcvd else None, e.rcvd.reason if e.rcvd else "")
+    if m["t"] == 3:
+        return ("result", ws)
+    code, _ = await close_code(ws)
+    return ("error", m.get("c"), m.get("m"), code)
+
+
+def route_of(gw, tok, path):
+    r = route(gw, tok, path)
+    return r.json()["module"] if r.status_code == 200 else r.status_code
+
+
+async def scenario_register_before_load(gw, tok, peer, peer_master):
+    print("17. /register on a fresh worker before its first reload: close 1013, no CALLERROR; the 409 comes on the retry (T769)")
+    if not peer or not peer_master:
+        print("  [skip] needs --peer and --peer-master-pid")
+        return
+    import signal
+
+    def children():
+        try:
+            with open(f"/proc/{peer_master}/task/{peer_master}/children") as f:
+                return set(f.read().split())
+        except OSError:
+            return set()
+
+    holder = None
+    try:
+        r = await register_outcome(gw, tok, "own17", "o1", prefixes=["/api/v2/own17"])
+        check(r[0] == "result", "own17/o1 registered on my side")
+        holder = Holder(r[1])
+        deadline = time.time() + 3
+        while time.time() < deadline and listing(peer, tok).get(("own17", "o1"), {}).get("state") != "ready":
+            await asyncio.sleep(0.1)
+        check(listing(peer, tok).get(("own17", "o1"), {}).get("state") == "ready", "peer: own17/o1 ready via NOTIFY")
+        seen = collections.Counter()
+        for _ in range(3):
+            before = children()
+            os.kill(peer_master, signal.SIGHUP)
+            until = time.time() + 3
+            while time.time() < until and not (children() - before):
+                await asyncio.sleep(0.01)
+            # Another module claims a prefix nested in own17's, at once and for the next two seconds:
+            # the fresh worker refuses it 1013 until its table is loaded, 409 after; never accepts it.
+            until = time.time() + 2
+            while time.time() < until:
+                try:
+                    o = await register_outcome(peer, tok, "cross17", "c1", prefixes=["/api/v2/own17/sub"])
+                except (OSError, websockets.InvalidHandshake, asyncio.TimeoutError):
+                    seen["dropped"] += 1   # a retiring worker closing an accepted connection
+                    continue
+                if o[0] == "result":
+                    seen["accepted"] += 1
+                    await o[1].close()
+                elif o[0] == "closed":
+                    seen[f"close {o[1]} {o[2]}"] += 1
+                else:
+                    seen[f"{o[1]} + close {o[3]}"] += 1
+                await asyncio.sleep(0.02)
+        print(f"  outcomes on the peer across 3 SIGHUPs: {dict(seen)}")
+        check(seen["accepted"] == 0, "the nested prefix of another module was never accepted")
+        check(seen["close 1013 routing table loading"] > 0, "a fresh worker closed the /register 1013 before its first reload")
+        check(seen["409 + close 1008"] > 0 and
+              set(seen) <= {"close 1013 routing table loading", "409 + close 1008", "dropped"},
+              "every other outcome is CALLERROR 409 and close 1008")
+        check(route_of(peer, tok, "/api/v2/own17/sub/x") == "own17" and route_of(peer, tok, "/api/v2/own17/x") == "own17",
+              "the peer routes both paths to own17")
+        check(holder.closed is None, "own17's socket is alive")
+    finally:
+        if holder:
+            await holder.stop()
+
+
+async def scenario_register_race(gw, tok, peer, pg_dsn, pg_container):
+    print("18. two modules register overlapping prefixes on two workers at once: the earlier registration keeps "
+          "the prefix on both, the later one is closed 1008 (T769)")
+    if not peer or not pg_dsn or not pg_container:
+        print("  [skip] needs --peer, --pg and --pg-container")
+        return
+    import psycopg2
+    import subprocess
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+    held = {}
+    try:
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module IN ('race18a', 'race18b')")
+        # The database paused: neither upsert commits, neither NOTIFY travels — each worker sees only its own socket.
+        subprocess.run(["docker", "pause", pg_container], check=True, capture_output=True)
+        try:
+            ra, rb = await asyncio.gather(
+                register_outcome(gw, tok, "race18a", "a1", prefixes=["/api/v2/race18"]),
+                register_outcome(peer, tok, "race18b", "b1", prefixes=["/api/v2/race18/sub"]))
+        finally:
+            subprocess.run(["docker", "unpause", pg_container], check=True, capture_output=True)
+        check(ra[0] == "result" and rb[0] == "result", "both registrations accepted while the workers could not know of each other")
+        held = {"race18a": Holder(ra[1]), "race18b": Holder(rb[1])}
+        await asyncio.sleep(1)
+        cur = pg.cursor()
+        # No state filter: the loser's worker may have reloaded and written it offline already; `registered` stays.
+        cur.execute("SELECT module FROM gateway.node WHERE module IN ('race18a', 'race18b')"
+                    " ORDER BY registered, module")
+        order = [m for (m,) in cur.fetchall()]
+        check(len(order) == 2, f"both rows in gateway.node ({order})")
+        winner, loser = order
+        print(f"  registered first: {winner}")
+        t0 = time.time()
+        while time.time() - t0 < 2 * RELOAD + 3 and held[loser].closed is None:
+            await asyncio.sleep(0.2)
+        check(held[loser].closed is not None and held[loser].closed[0] == 1008 and
+              held[loser].closed[1].endswith(f"belongs to module {winner}"),
+              f"{loser} closed by its worker's reload: {held[loser].closed}")
+        check(held[winner].closed is None, f"{winner}'s socket is alive")
+        await asyncio.sleep(RELOAD + 1)   # the other worker's reload too
+        for name, g in (("mine", gw), ("peer", peer)):
+            got = {p: route_of(g, tok, p) for p in ("/api/v2/race18/x", "/api/v2/race18/sub/x")}
+            print(f"  {name}: {got}")
+            check(loser not in got.values(), f"{name}: no path goes to {loser}")
+            check(got["/api/v2/race18/sub/x"] == winner, f"{name}: the overlapping path goes to {winner}")
+        cur.execute("SELECT state FROM gateway.node WHERE module = %s", (loser,))
+        check(cur.fetchone()[0] == "offline", f"{loser}'s row offline")
+    finally:
+        for h in held.values():
+            await h.stop()
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module IN ('race18a', 'race18b')")
+        pg.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -1620,7 +1800,9 @@ async def main():
                  lambda gw, tok: scenario_prefix_handoff(gw, tok, args.pg),
                  lambda gw, tok: scenario_commands_relayed(gw, tok, args.peer, args.pg, args.pg_container),
                  lambda gw, tok: scenario_statement_lost(gw, tok, args.peer, args.pg, args.pg_container,
-                                                         args.peer_master_pid)]
+                                                         args.peer_master_pid),
+                 lambda gw, tok: scenario_register_before_load(gw, tok, args.peer, args.peer_master_pid),
+                 lambda gw, tok: scenario_register_race(gw, tok, args.peer, args.pg, args.pg_container)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):
