@@ -1810,7 +1810,21 @@ void GatewayAPI::mirror_next()
 
 void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason, std::string_view reason, bool reassert)
 {
-    std::string sql;
+    // One writer of a (module, instance) row at a time, across workers and
+    // pods (T1211). Two registrations of one instance milliseconds apart on
+    // two pods: the first INSERT is not committed yet, so the second
+    // transaction's offline step sees no row and changes nothing, and its
+    // ON CONFLICT waits for the first, then turns ready into ready — the
+    // trigger is silent on an UPDATE that keeps the state, so neither the
+    // journal nor any worker hears of the takeover, and the replaced socket
+    // stays open until the next reload. Under the lock the second transaction
+    // starts its statements after the first has committed: the offline step
+    // sees the row, and the takeover is the offline + ready pair of NOTIFYs
+    // the other workers act on. Transaction-scoped: released at the commit
+    // that makes the row visible; '/' is not in a valid name, so two pairs
+    // never make one key.
+    std::string sql = fmt::format("SELECT pg_advisory_xact_lock(hashtextextended({}, 0));\n",
+                                  pq_quote_literal(fmt::format("gateway.node/{}/{}", inst.module, inst.instance)));
     if (!pre_reason.empty())
         sql += fmt::format(
             "SELECT set_config('gateway.reason', {}, true);\n"
@@ -1837,8 +1851,12 @@ void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason
                                pq_quote_literal(node_), pid_)
                  : std::string{});
     // One simple-protocol query string: the statements run as ONE transaction
-    // (no explicit BEGIN), so the transaction-local GUC reaches the trigger
-    // and both NOTIFYs leave on the same commit, in this order.
+    // (no explicit BEGIN), so the transaction-local GUC reaches the trigger,
+    // both NOTIFYs leave on the same commit, in this order, and the advisory
+    // lock above is held to that commit — split the string and the lock goes
+    // early. It relies on READ COMMITTED (each statement its own snapshot,
+    // taken after the lock): under repeatable read the offline step would
+    // still miss a row committed while it waited.
     mirror_exec(std::move(sql), fmt::format("upsert {}/{}", inst.module, inst.instance));
     inst.written = inst.upserted = mirror_seq_;
 }

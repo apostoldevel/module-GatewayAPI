@@ -46,6 +46,11 @@ until its first reload and refuses it `409` after — never accepts it (T769). S
 both are accepted, and after the reloads the one registered first (`gateway.node.registered`, ties by module)
 keeps the prefix on both gateways while the other is closed `1008`. On a gateway that checks /register against
 its own sockets only, or keeps "own sockets win" in the reload, both turn red.
+Scenario 19 (`--peer`, `--pg` as a role allowed to `LOCK gateway.log IN SHARE MODE`) holds the journal
+locked so that this gateway's `INSERT` of a new instance stays uncommitted, and registers the same instance on the
+peer meanwhile (T1211): after the release the journal shows the first holder's `offline` and the peer's `ready`, and
+the old socket is closed `1001` within 1.5 s. On a gateway whose registrations of one instance are not serialised the
+peer turns `ready` into `ready` in silence — one journal row, the old socket open until the next reload — red.
 
 Gateway configuration for a run: `heartbeat_interval` 2 (scenario 4 waits for suspect/offline by
 the clock), `allowed_cidr` with 127.0.0.0/8, `response_timeout_ms` 2000 (scenario 9 waits for a
@@ -1766,6 +1771,85 @@ async def scenario_register_race(gw, tok, peer, pg_dsn, pg_container):
         pg.close()
 
 
+async def scenario_takeover_uncommitted(gw, tok, peer, pg_dsn):
+    print("19. the same instance registers on the peer while this gateway's INSERT of it is not committed yet: "
+          "the takeover is journalled and this gateway closes the old socket 1001 at once, not at its next reload (T1211)")
+    if not peer or not pg_dsn:
+        print("  [skip] needs --peer and --pg")
+        return
+    import psycopg2
+    import psycopg2.errors
+    module, instance = f"take19{int(time.time() * 1000) % 1000000}", "t1"
+    pg = psycopg2.connect(pg_dsn)
+    pg.autocommit = True
+    hold = psycopg2.connect(pg_dsn)          # holds the trigger of the first upsert: its INSERT stays uncommitted
+    old = new = None
+    try:
+        cur = hold.cursor()
+        try:
+            cur.execute("LOCK TABLE gateway.log IN SHARE MODE")
+        except psycopg2.errors.InsufficientPrivilege:
+            hold.rollback()
+            print("  [skip] the --pg role may not LOCK gateway.log IN SHARE MODE")
+            return
+
+        def waiting():
+            c = pg.cursor()
+            c.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                      " AND query LIKE %s", (f"%gateway.node%{module}%",))
+            return c.fetchone()[0]
+
+        async def until_waiting(n):
+            t0 = time.time()
+            while waiting() < n and time.time() - t0 < 5:
+                await asyncio.sleep(0.05)
+            return waiting()
+
+        ra = await register_outcome(gw, tok, module, instance)
+        check(ra[0] == "result", f"registered on this gateway: {ra[0]}")
+        old = Holder(ra[1])
+        check(await until_waiting(1) >= 1, "this gateway's upsert is held inside its transaction")
+        # The module reconnects to the peer: the peer has heard nothing of the first registration.
+        rb = await register_outcome(peer, tok, module, instance)
+        check(rb[0] == "result", f"registered on the peer: {rb[0]}")
+        new = Holder(rb[1])
+        check(await until_waiting(2) >= 2, "the peer's upsert waits for the first one")
+        t_release = time.time()
+        hold.commit()                        # the first upsert commits, the peer's follows it
+        while time.time() - t_release < 3 and old.closed is None:
+            await asyncio.sleep(0.05)
+        closed_after = time.time() - t_release
+        c = pg.cursor()
+        c.execute("SELECT node, worker, state FROM gateway.node WHERE module = %s AND instance = %s", (module, instance))
+        row = c.fetchone()
+        c.execute("SELECT coalesce(state_from, '(none)'), state_to, node, reason FROM gateway.log"
+                  " WHERE module = %s AND instance = %s ORDER BY id", (module, instance))
+        log = c.fetchall()
+        print(f"  row {row}; log {log}; old socket {old.closed} after {closed_after:.2f} s")
+        check(row is not None and row[2] == "ready", f"the row is ready: {row}")
+        # The journal is the deterministic half: the takeover is an offline of the first holder and a ready of the
+        # second. Without it the peer's upsert turned ready into ready — no transition, no NOTIFY — and this gateway
+        # heard of the takeover only by its next reload (up to reload_interval later).
+        check(len(log) == 3 and log[1][:2] == ("ready", "offline") and log[2][:2] == ("offline", "ready")
+              and log[1][2] != log[2][2], f"takeover journalled as offline + ready of the new holder: {log}")
+        check(row[0] == log[2][2], f"the row names the new holder: {row} vs {log[2]}")
+        # The socket half: closed on the NOTIFY, well inside the reload interval.
+        check(old.closed is not None and old.closed[0] == 1001 and closed_after < 1.5,
+              f"old socket closed 1001 within 1.5 s of the commit: {old.closed} after {closed_after:.2f} s")
+        check(new.closed is None, "the new socket is alive")
+    finally:
+        try:
+            hold.rollback()
+        except Exception:
+            pass
+        hold.close()
+        for h in (old, new):
+            if h:
+                await h.stop()
+        pg.cursor().execute("UPDATE gateway.node SET state = 'offline' WHERE module = %s", (module,))
+        pg.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -1802,7 +1886,8 @@ async def main():
                  lambda gw, tok: scenario_statement_lost(gw, tok, args.peer, args.pg, args.pg_container,
                                                          args.peer_master_pid),
                  lambda gw, tok: scenario_register_before_load(gw, tok, args.peer, args.peer_master_pid),
-                 lambda gw, tok: scenario_register_race(gw, tok, args.peer, args.pg, args.pg_container)]
+                 lambda gw, tok: scenario_register_race(gw, tok, args.peer, args.pg, args.pg_container),
+                 lambda gw, tok: scenario_takeover_uncommitted(gw, tok, args.peer, args.pg)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):
