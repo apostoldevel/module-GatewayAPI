@@ -1211,6 +1211,7 @@ void GatewayAPI::reply_refused(HttpResponse& resp, const Refusal& refusal)
             title = status == 401 ? "Unauthorized" : "Refresh Refused";
             break;
         case Kind::internal:       slug = "internal";      title = "Internal Server Error"; break;
+        case Kind::malformed:      slug = "bad-request";   title = "Bad Request"; break;
     }
 
     reply_problem(resp, status, slug, title, refusal.message, refusal.path);
