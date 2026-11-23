@@ -234,6 +234,22 @@ private:
     /// @p detail is within the §3 alphabet — the go-platform host's rule.
     static void set_challenge(HttpResponse& resp, std::string_view detail, bool no_credentials);
 
+    /// A path of v1_routes: the request runs as its API v1 twin, through the
+    /// inherited AppServer::execute with the path's /api/v2 head replaced by
+    /// /api/v1 — the same statement, the same session (README § API v1 routes).
+    void execute_v1(const HttpRequest& req, std::shared_ptr<HttpConnection> conn,
+                    const ExecContext& ctx, std::string_view method,
+                    const std::string& payload, const ResultShaping& shaping);
+    /// ExecContext::finish of a v1 route: X-Request-Id on every answer; a
+    /// refusal (status >= 400) in application/json rewritten as problem+json,
+    /// its ERR-… identifier kept (README § Errors). @p source is the text the
+    /// answer was made from. Static: it runs after the module may be gone.
+    static void v1_finish(HttpResponse& r, std::string_view source,
+                          std::string_view instance_path, std::string_view request_id);
+    /// The refusal of @p prefixes by v1_routes_ — the /register 409 text and
+    /// the mirror's reason; empty — none overlaps.
+    std::string v1_route_claim(const std::vector<std::string>& prefixes) const;
+
     // ── WebSocket ──────────────────────────────────────────────────────────
 
     std::shared_ptr<Node> add_node(WsConnection ws, std::string module,
@@ -428,6 +444,7 @@ private:
 
     // module.GatewayAPI (README § Configuration)
     std::string control_path_{"/gateway"};
+    std::vector<std::string> v1_routes_;   // exact /api/v2/… paths served as API v1 (README § API v1 routes)
     int         heartbeat_interval_{5};
     int         suspect_after_{2};
     int         offline_after_{4};

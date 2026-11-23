@@ -142,6 +142,26 @@ GatewayAPI::GatewayAPI(Application& app)
         offline_after_      = cfg->value("offline_after", offline_after_);
         audience_           = cfg->value("audience", audience_);
 
+        // Exact paths under /api/v2 that run as their API v1 twin
+        // (README § API v1 routes). Empty by default: then nothing changes.
+        if (cfg->contains("v1_routes")) {
+            const auto& routes = (*cfg)["v1_routes"];
+            if (routes.is_array()) {
+                for (const auto& item : routes) {
+                    if (!item.is_string() || !valid_prefix(item.get<std::string>())) {
+                        log_.warn("GatewayAPI: v1_routes entry {} ignored (^/api/v2/[a-z0-9_/-]+$, no trailing '/')",
+                                  item.dump());
+                        continue;
+                    }
+                    auto path = item.get<std::string>();
+                    if (std::find(v1_routes_.begin(), v1_routes_.end(), path) == v1_routes_.end())
+                        v1_routes_.push_back(std::move(path));
+                }
+            } else {
+                log_.warn("GatewayAPI: v1_routes ignored (an array of paths, got {})", routes.type_name());
+            }
+        }
+
         // An array, or one string "a.b.c.d/n, e.f.g.h/m" — the form a value
         // taken from the environment ("${GATEWAY_ALLOWED_CIDR}") arrives in:
         // substitution happens inside strings only. A blank string is an
@@ -225,9 +245,9 @@ GatewayAPI::GatewayAPI(Application& app)
         log_.error("GatewayAPI: audience '{}' ({}) has an empty client_secret — every module will be refused (unauthorized)",
                    audience_, aud_app->client_id);
 
-    log_.notice("GatewayAPI: {} control_path={} heartbeat_interval={}s suspect_after={} offline_after={} audience={} cidr={}",
+    log_.notice("GatewayAPI: {} control_path={} heartbeat_interval={}s suspect_after={} offline_after={} audience={} cidr={} v1_routes={}",
                 self_, control_path_, heartbeat_interval_, suspect_after_, offline_after_, audience_,
-                allowed_cidr_.size());
+                allowed_cidr_.size(), v1_routes_.size());
 }
 
 void GatewayAPI::init_methods()
@@ -1002,6 +1022,9 @@ void GatewayAPI::handle_register(const std::shared_ptr<Node>& node, const std::s
         return;
     }
 
+    // 409 — a prefix the gateway serves itself as an API v1 route
+    if (const auto claim = v1_route_claim(prefixes); !claim.empty()) { fail(409, claim); return; }
+
     // 409 — a prefix owned by ANOTHER module
     for (const auto& [mod, insts] : table_) {
         if (mod == node->module) continue;
@@ -1218,9 +1241,14 @@ void GatewayAPI::reply_refused(HttpResponse& resp, const Refusal& refusal)
 }
 
 void GatewayAPI::execute(const HttpRequest& req, std::shared_ptr<HttpConnection> conn,
-                         const ExecContext& ctx, std::string_view /*method*/,
-                         const std::string& /*payload*/, const ResultShaping& /*shaping*/)
+                         const ExecContext& ctx, std::string_view method,
+                         const std::string& payload, const ResultShaping& shaping)
 {
+    if (std::find(v1_routes_.begin(), v1_routes_.end(), req.path) != v1_routes_.end()) {
+        execute_v1(req, std::move(conn), ctx, method, payload, shaping);
+        return;
+    }
+
     // The access token that goes upstream: the Bearer the client sent (already
     // verified by check_auth), the cookie AT, or the NEW one after a refresh.
     // Basic / Session / Secret headers pass as they are (shape_upstream keeps
@@ -1247,6 +1275,97 @@ void GatewayAPI::execute(const HttpRequest& req, std::shared_ptr<HttpConnection>
         return;
     }
     forward_to(*inst, std::move(up), std::move(conn), ctx, std::move(request_id), 1);
+}
+
+// ─── API v1 routes (README § API v1 routes) ──────────────────────────────────
+
+void GatewayAPI::execute_v1(const HttpRequest& req, std::shared_ptr<HttpConnection> conn,
+                            const ExecContext& ctx, std::string_view method,
+                            const std::string& payload, const ResultShaping& shaping)
+{
+    const std::string request_id = new_uuid();
+
+    // A token is required, as on every /api/v2 path. The base step would take
+    // a call without one to the unauthorised or the guest statement — the
+    // guest one on the module's own service session; neither is offered here.
+    if (ctx.auth_type == AuthType::none) {
+        HttpResponse r;
+        reply_problem(r, 401, "token-invalid", "Unauthorized", "a token is required", req.path, request_id,
+                      /*no_credentials=*/true);
+        conn->send_response(r);
+        return;
+    }
+
+    // The v1 twin: the same statement under the /api/v1 path. "/api/v2" and
+    // "/api/v1" are of one length; the path is a valid_prefix, so it has the head.
+    HttpRequest v1 = req;
+    v1.path.replace(0, 7, "/api/v1");
+
+    ExecContext c = ctx;
+    c.finish = [instance_path = req.path, request_id](HttpResponse& r, std::string_view source) {
+        v1_finish(r, source, instance_path, request_id);
+    };
+    AppServer::execute(v1, std::move(conn), c, method, payload, shaping);
+}
+
+void GatewayAPI::v1_finish(HttpResponse& r, std::string_view source, std::string_view instance_path,
+                           std::string_view request_id)
+{
+    // The pair of reply_refused for an answer of the base step: a success goes
+    // as API v1 gives it, a refusal is problem+json like every /api/v2 answer.
+    r.set_header("X-Request-Id", std::string(request_id));
+
+    const int status = r.status_code();
+    if (status < 400) return;
+    // problem+json already (a refusal through reply_refused), or a body the
+    // database chose itself (#raw): left as it is.
+    const auto& hs = r.headers();
+    const auto ct = std::find_if(hs.begin(), hs.end(), [](const auto& h) { return h.first == "Content-Type"; });
+    if (ct == hs.end() || !ct->second.starts_with("application/json")) return;
+    // A #raw answer may carry a 4xx/5xx status and a JSON type of its own:
+    // its source is the database's {"#raw":{...}} — left as it is.
+    if (source.starts_with("{")) {
+        const auto j = json::parse(source, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("#raw")) return;
+    }
+
+    // The database's error envelope {"error":{"code","error","message"}}; for
+    // a failed statement the source is the driver's text, which stays here.
+    std::string message, id;
+    check_pg_error(source, message, id);
+
+    std::string type;
+    if (!id.empty())
+        type = "urn:apostol:error:" + id;       // the catalogue identifier, as the go-platform host gives it
+    else if (status < 500)
+        type = "urn:apostol:error:raise";       // a refusal without an identifier
+    else
+        type = "urn:apostol:gateway:internal";  // this side failed
+    if (message.empty()) message = status >= 500 ? "internal error" : "the request was refused";
+
+    const auto known = status_from_code(status);
+    const std::string title = known ? std::string(status_text(*known)) : std::string("Error");
+
+    const json body = {
+        {"type",       type},
+        {"title",      title},
+        {"status",     status},
+        {"detail",     message},
+        {"instance",   instance_path},
+        {"request_id", request_id},
+        {"code",       id.empty() ? json(nullptr) : json(id)},
+    };
+    // Status and headers (the challenge of a 401, cookies) stay as the base set them.
+    r.set_body(body.dump(), "application/problem+json");
+}
+
+std::string GatewayAPI::v1_route_claim(const std::vector<std::string>& prefixes) const
+{
+    for (const auto& route : v1_routes_)
+        for (const auto& mine : prefixes)
+            if (prefixes_overlap(route, mine))
+                return fmt::format("prefix {} overlaps {}, served by the gateway as an API v1 route", mine, route);
+    return {};
 }
 
 GatewayAPI::Upstream& GatewayAPI::upstream_for(const Instance& inst)
@@ -2165,6 +2284,7 @@ std::string GatewayAPI::mirror_refusal(const json& row) const
             if (prefixes_overlap(have, s)) return fmt::format("prefixes overlap: {} and {}", have, s);
         prefixes.push_back(s);
     }
+    if (auto claim = v1_route_claim(prefixes); !claim.empty()) return claim;
     const auto taken = [&](const std::string& mod, const std::vector<std::string>& theirs) -> std::string {
         for (const auto& t : theirs)
             for (const auto& mine : prefixes)

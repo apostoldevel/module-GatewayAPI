@@ -51,6 +51,11 @@ locked so that this gateway's `INSERT` of a new instance stays uncommitted, and 
 peer meanwhile (T1211): after the release the journal shows the first holder's `offline` and the peer's `ready`, and
 the old socket is closed `1001` within 1.5 s. On a gateway whose registrations of one instance are not serialised the
 peer turns `ready` into `ready` in silence — one journal row, the old socket open until the next reload — red.
+Scenario 20 (`--v1-route`, a path the gateway lists in `v1_routes`) checks a path served as API v1 (README § API v1
+routes): a /register whose prefix equals the path, or holds it, is refused 409; a prefix next to it is taken. Without a
+token the path answers 401 problem+json with the bare challenge; with one, the answer and its status are those of the
+`/api/v1` twin — a refusal as problem+json with the twin's `ERR-…` identifier. With the path left out of `v1_routes`
+it turns red.
 
 Gateway configuration for a run: `heartbeat_interval` 2 (scenario 4 waits for suspect/offline by
 the clock), `allowed_cidr` with 127.0.0.0/8, `response_timeout_ms` 2000 (scenario 9 waits for a
@@ -1850,6 +1855,54 @@ async def scenario_takeover_uncommitted(gw, tok, peer, pg_dsn):
         pg.close()
 
 
+async def scenario_v1_route(gw, tok, route):
+    print("20. a path served as API v1 (README § API v1 routes)")
+    if not route:
+        print("  skipped: no --v1-route")
+        return
+    twin = "/api/v1/" + route[len("/api/v2/"):]
+    parent = route.rsplit("/", 1)[0]
+
+    # A one-segment route has no parent under /api/v2 that is a valid prefix (that one would be a 422).
+    held = [("the path itself", [route]), ("a path nested in it", [route + "/x"])]
+    if parent != "/api/v2":
+        held.append(("a prefix holding it", [parent]))
+    for name, prefixes in held:
+        ws = await connect(gw, tok, "v1probe", "p1")
+        await ws.send(call("/register", register_payload("v1probe", "p1", prefixes=prefixes)))
+        r = await rx(ws)
+        cc, _ = await close_code(ws)
+        check(r["t"] == 4 and r["c"] == 409 and cc == 1008, f"/register {prefixes} ({name}) → 409 + close {cc}")
+    ws = await connect(gw, tok, "v1probe", "p2")
+    r = await register(ws, "v1probe", "p2", prefixes=[route + "x"])
+    check(r["t"] == 3, f"/register [{route}x] (no overlap) → accepted")
+    await ws.send(call("/unregister", {"reason": "done"}))
+    await rx(ws)
+    await close_code(ws)
+
+    r = await asyncio.to_thread(requests.post, f"{gw}{route}", json={}, timeout=5)
+    p = r.json() if r.headers.get("Content-Type", "").startswith("application/problem+json") else {}
+    check(r.status_code == 401 and p.get("code") == "ERR-401-001" and r.headers.get("WWW-Authenticate") == "Bearer"
+          and p.get("instance") == route, f"no token → 401 problem+json, bare challenge ({r.status_code} {p.get('code')})")
+
+    # One body for both: an empty object — the twin refuses it or takes it, either way the two must agree.
+    auth = {"Authorization": f"Bearer {tok}"}
+    v1 = await asyncio.to_thread(requests.post, f"{gw}{twin}", json={}, headers=auth, timeout=10)
+    v2 = await asyncio.to_thread(requests.post, f"{gw}{route}", json={}, headers=auth, timeout=10)
+    check(v2.status_code == v1.status_code, f"status as the twin's: v2 {v2.status_code}, v1 {v1.status_code}")
+    check(len(v2.headers.get("X-Request-Id", "")) == 36, "X-Request-Id on the answer")
+    if v1.status_code < 400:
+        check(v2.content == v1.content and v2.headers.get("Content-Type") == v1.headers.get("Content-Type"),
+              "success → the twin's body and type, byte for byte")
+    else:
+        err = v1.json().get("error", {}) if v1.headers.get("Content-Type", "").startswith("application/json") else {}
+        p = v2.json() if v2.headers.get("Content-Type", "").startswith("application/problem+json") else {}
+        check(p.get("status") == v1.status_code and p.get("instance") == route, f"refusal → problem+json ({p})")
+        if str(err.get("error", "")).startswith("ERR-"):
+            check(p.get("code") == err["error"] and p.get("type") == "urn:apostol:error:" + err["error"]
+                  and p.get("detail") == err.get("message"), f"the twin's identifier kept: {err.get('error')}")
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", default="http://127.0.0.1:4988")
@@ -1861,6 +1914,7 @@ async def main():
     ap.add_argument("--pg-password-file", help="password for --pg (otherwise PGPASSWORD)")
     ap.add_argument("--peer-master-pid", type=int, help="pid of the peer's master process (scenario 12 sends it SIGHUP)")
     ap.add_argument("--pg-container", help="docker container of the database (scenario 15 pauses it for a few seconds)")
+    ap.add_argument("--v1-route", help="a path of the gateway's v1_routes (scenario 20)")
     args = ap.parse_args()
     if args.pg and args.pg_password_file:
         args.pg += " password=" + open(args.pg_password_file).read().strip()
@@ -1887,7 +1941,8 @@ async def main():
                                                          args.peer_master_pid),
                  lambda gw, tok: scenario_register_before_load(gw, tok, args.peer, args.peer_master_pid),
                  lambda gw, tok: scenario_register_race(gw, tok, args.peer, args.pg, args.pg_container),
-                 lambda gw, tok: scenario_takeover_uncommitted(gw, tok, args.peer, args.pg)]
+                 lambda gw, tok: scenario_takeover_uncommitted(gw, tok, args.peer, args.pg),
+                 lambda gw, tok: scenario_v1_route(gw, tok, args.v1_route)]
     only = {int(x) for x in args.only.split(",")} if args.only else None
     try:
         for i, sc in enumerate(scenarios, 1):

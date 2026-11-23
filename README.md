@@ -97,7 +97,7 @@ The first frame, within **5 s** of the upgrade (otherwise close `1008`):
 | `version` | string | yes | semver, informational |
 | `build` | string | no | build hash or date, informational |
 | `address` | string | yes | `"<ipv4>:<port>"`, an **IPv4 literal** — the gateway resolves no names and connects to it as given; must fall within `allowed_cidr`, otherwise `403`. The module's own local address of the WebSocket connection is a good default: it is the address the gateway certainly reaches |
-| `prefixes` | string[] | yes, ≥ 1 | each `^/api/v2/[a-z0-9_/-]+$`, no `*`, no trailing `/`. An overlap (equality or nesting) with a prefix of **another** module → `409`; an overlap within the request → `422`. Instances of one module may carry different sets (a rolling update): a route is chosen among the instances **carrying** the matched prefix |
+| `prefixes` | string[] | yes, ≥ 1 | each `^/api/v2/[a-z0-9_/-]+$`, no `*`, no trailing `/`. An overlap (equality or nesting) with a prefix of **another** module or with a path of `v1_routes` → `409`; an overlap within the request → `422`. Instances of one module may carry different sets (a rolling update): a route is chosen among the instances **carrying** the matched prefix |
 | `capacity` | int | yes | ≥ 1; requests in flight the module accepts from **all** workers together, informational |
 
 The reply **is** `ready` — no separate `/status ready` is needed:
@@ -144,7 +144,7 @@ These are issued through the management endpoints below.
 | `400` | frame not parsed; missing or duplicate `u`; `t` not an integer in {2, 3, 4}; JSON nested deeper than 128; `p` not an object; a required field missing or of the wrong type | on `/register` — close `1008`; otherwise lives |
 | `403` | `address` outside `allowed_cidr` | close `1008` |
 | `404` | unknown `a` | lives |
-| `409` | a prefix of another module; a CALL before `/register` | on `/register` — close `1008`; otherwise lives |
+| `409` | a prefix of another module or overlapping a path of `v1_routes`; a CALL before `/register` | on `/register` — close `1008`; otherwise lives |
 | `422` | `module` / `instance` differ from the URL; prefixes overlap within the request; `capacity` < 1; `state` outside the set; a registration whose mirror notification would not fit into 8000 bytes (too many or too long prefixes) | on `/register` — close `1008`; otherwise lives |
 | `429` | heartbeat faster than `heartbeat_interval / 2` | lives, frame dropped |
 | `500` | internal error of the side | lives |
@@ -213,6 +213,18 @@ Upstream, on the copy that reaches the module:
 
 Downstream, on the module's answer before it reaches the client: status and body as the module sent them; hop-by-hop headers and **`Set-Cookie` of the module removed** (cookies are set by the refresh only); `X-Request-Id` forced to the gateway's; the refresh's `Set-Cookie`, if there was one, added. The module should return `X-Request-Id` with the same value and should not use `Transfer-Encoding: chunked` (`HttpProxy` buffers the whole answer).
 
+### API v1 routes
+
+`v1_routes` lists exact paths under `/api/v2` that the gateway does not send to a module: each runs as its API v1 twin — the same path with `/api/v2` replaced by `/api/v1` — through the inherited `AppServer` step, the same `daemon.*fetch` statement as the twin, no proxy. A client with one base path reaches these operations under it. Empty by default: then the gateway behaves as without the key.
+
+- **Exact match** on the path: `/api/v2/sign/up` is in the table, `/api/v2/sign/up/x` and `/api/v2/sign` are not served as API v1. No module can hold them either (*Held paths* below), so they answer `404` no route.
+- **A token is required**, as on every `/api/v2` path. Without one the answer is `401` `token-invalid`, `code` `ERR-401-001`, `WWW-Authenticate: Bearer` — the guest step of `AppServer` (`guest_routes`) is not taken from here. With a Bearer token, a cookie token (refreshed like on any path) or `Basic` the statement is the twin's, under the same session.
+- **A success** is the twin's answer, status, body and type as API v1 gives them, plus `X-Request-Id`.
+- **A refusal** (status ≥ 400) is `problem+json`, the status kept: `type` `urn:apostol:error:<ERR-…>` and `code` the identifier of the database's refusal, `detail` its message; a refusal without an identifier is `urn:apostol:error:raise` (4xx) or `urn:apostol:gateway:internal` (5xx). Headers set by the step (the `401` challenge, cookies) stay.
+- **Held paths.** A path of the table counts as a held prefix: a `/register` whose prefix equals or nests with it is refused `409` (`prefix … served by the gateway as an API v1 route`), and a mirror row with such a prefix is refused on the re-read. A module never shadows a table path, and a table path never silently shadows a module.
+
+An entry that is not a valid prefix (`^/api/v2/[a-z0-9_/-]+$`, no trailing `/`) is skipped with a warning. The key is a JSON array, read at start: unlike `allowed_cidr`, it takes no comma-separated string from the environment.
+
 ### Errors
 
 Everything the gateway answers on its own is `application/problem+json` (RFC 9457):
@@ -239,7 +251,7 @@ Everything the gateway answers on its own is `application/problem+json` (RFC 945
 | `504` | `upstream-timeout` | no complete answer within `response_timeout_ms`; a command not answered in 5 s; a relayed command no worker answered in 9 s | |
 | other | `refresh-refused`, `internal` | the database refused the refresh with a status other than 401; an internal error | |
 
-`code` is `null` except on a `401`, which carries the catalogue id the go-platform host gives the same case — every way a token fails to verify is `ERR-401-001` (a separate "bad signature" id would tell a prober which check it passed). Every `401` carries `WWW-Authenticate` (RFC 6750 §3): a bare `Bearer` when the request carried no credentials at all (no `Authorization`, another scheme, an empty token — §3.1; the data plane never answers that itself, it passes such a request on to the host), otherwise `Bearer error="invalid_token"`, with `error_description` only when `detail` is within the §3 alphabet (printable ASCII without `"` and `\`) — the same rule as the host.
+`code` is `null` except on a `401`, which carries the catalogue id the go-platform host gives the same case — every way a token fails to verify is `ERR-401-001` (a separate "bad signature" id would tell a prober which check it passed). Every `401` carries `WWW-Authenticate` (RFC 6750 §3): a bare `Bearer` when the request carried no credentials at all (no `Authorization`, another scheme, an empty token — §3.1; the data plane answers that itself only on a path of `v1_routes`, otherwise it passes such a request on to the host), otherwise `Bearer error="invalid_token"`, with `error_description` only when `detail` is within the §3 alphabet (printable ASCII without `"` and `\`) — the same rule as the host.
 
 A module answers in the same shape with `type = urn:apostol:error:<code>` and `code` set; the gateway passes such answers through untouched.
 
@@ -323,7 +335,8 @@ Section `module.GatewayAPI` of the application's JSON configuration:
   "response_timeout_ms": 30000,
   "reload_interval": 60,
   "allowed_cidr": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-  "audience": "gateway"
+  "audience": "gateway",
+  "v1_routes": []
 }
 ```
 
@@ -339,6 +352,7 @@ Section `module.GatewayAPI` of the application's JSON configuration:
 | `reload_interval` | `60` | seconds between re-reads of `gateway.node` and sweeps |
 | `allowed_cidr` | `[]` | IPv4 networks `a.b.c.d/n` an instance may register an `address` in; an empty list refuses every registration with `403`. An array, or one comma-separated string — the form a value from the environment takes (`"allowed_cidr": "${GATEWAY_ALLOWED_CIDR}"`, substitution works inside strings only); a blank string is the default. An entry that does not parse — or is not a string, or a value of another type — is skipped with a warning; `/00` does not parse (it would read as `/0`) |
 | `audience` | `service` | the OAuth2 provider (section of `oauth2/*.json`) whose tokens open the control plane |
+| `v1_routes` | `[]` | exact `/api/v2/…` paths served as their API v1 twin (*API v1 routes*); an entry that is not a valid prefix is skipped with a warning |
 
 The worker's identity is not a key of this section: it is the application's `node` (top level of the configuration, e.g. `"node": "${NODE_NAME}"`), else `$NODE_NAME`, else the host name (*Mirror*, **Identity**). Two gateway processes on one database must not share a node name unless they share a PID namespace too. In Kubernetes set `NODE_NAME` from `metadata.name` (the pod), **not** `spec.nodeName` (the machine: two pods on one machine would share it); in docker the container's host name is unique — except with `network_mode: host`, an explicit `hostname:`, or `hostNetwork: true` in Kubernetes, where it is the machine's or a shared one: set `node` explicitly there.
 
