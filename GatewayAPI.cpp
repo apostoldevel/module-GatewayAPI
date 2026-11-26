@@ -1235,6 +1235,7 @@ void GatewayAPI::reply_refused(HttpResponse& resp, const Refusal& refusal)
             break;
         case Kind::internal:       slug = "internal";      title = "Internal Server Error"; break;
         case Kind::malformed:      slug = "bad-request";   title = "Bad Request"; break;
+        case Kind::forbidden:      slug = "forbidden";     title = "Forbidden"; break;
     }
 
     reply_problem(resp, status, slug, title, refusal.message, refusal.path);
