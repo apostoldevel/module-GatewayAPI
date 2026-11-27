@@ -25,7 +25,7 @@ then is not yet a 404. Scenario 13 (`--pg`) kills the listening connections and 
 the same transaction: its NOTIFY is lost, and the row must appear on the reload the gateway runs
 when LISTEN is confirmed again, well before `reload_interval`.
 Scenario 11 (`--peer`, `--pg`) needs the two gateways to run under ONE pid — each in a PID namespace of
-its own (a container each: `run11.sh` next to the stand's `run.sh`), with the network shared. With
+its own (a container each: `run11.sh` next to the test's `run.sh`), with the network shared. With
 different `NODE_NAME`s an instance registered on one of them must stay `ready` over three reloads, with
 no `no socket on worker` in `gateway.log`; with the same `NODE_NAME` — or on a binary that identifies
 a worker by its pid alone — the other one closes the live row every reload (the negative control).
@@ -41,14 +41,14 @@ Scenario 16 (`--peer`, `--pg` as a role that may signal the gateways' backends, 
 503, and 503 `routes-loading`, not 404. Run on a gateway whose pool does not repeat them, both turn red.
 Scenario 17 (`--peer`, `--peer-master-pid`) registers, right after each SIGHUP of the peer's master, a module
 whose prefix nests in one this gateway holds: the fresh worker closes the /register `1013` without a CALLERROR
-until its first reload and refuses it `409` after — never accepts it (T769). Scenario 18 (`--peer`, `--pg`,
+until its first reload and refuses it `409` after — never accepts it. Scenario 18 (`--peer`, `--pg`,
 `--pg-container`) pauses the database and registers two modules with overlapping prefixes, one on each gateway:
 both are accepted, and after the reloads the one registered first (`gateway.node.registered`, ties by module)
 keeps the prefix on both gateways while the other is closed `1008`. On a gateway that checks /register against
 its own sockets only, or keeps "own sockets win" in the reload, both turn red.
 Scenario 19 (`--peer`, `--pg` as a role allowed to `LOCK gateway.log IN SHARE MODE`) holds the journal
 locked so that this gateway's `INSERT` of a new instance stays uncommitted, and registers the same instance on the
-peer meanwhile (T1211): after the release the journal shows the first holder's `offline` and the peer's `ready`, and
+peer meanwhile: after the release the journal shows the first holder's `offline` and the peer's `ready`, and
 the old socket is closed `1001` within 1.5 s. On a gateway whose registrations of one instance are not serialised the
 peer turns `ready` into `ready` in silence — one journal row, the old socket open until the next reload — red.
 Scenario 20 (`--v1-route`, a path the gateway lists in `v1_routes`) checks a path served as API v1 (README § API v1
@@ -223,7 +223,7 @@ async def scenario_register_errors(gw, tok):
     cc, _ = await close_code(ws2)
     check(r["t"] == 4 and r["c"] == 409 and cc == 1008, f"→ 409 + close {cc}")
     # A close frame carries at most 123 bytes of reason (RFC 6455 §5.5): a longer one is a protocol error, and
-    # the module would read a lost connection instead of the refusal (T769).
+    # the module would read a lost connection instead of the refusal.
     ws2 = await connect(gw, tok, "other", "o1")
     await ws2.send(call("/register", register_payload("other", "o1", prefixes=["/api/v2/clients/" + "v" * 120])))
     r = await rx(ws2)
@@ -636,7 +636,7 @@ async def scenario_data_plane(gw, tok):
                                         headers={"Authorization": f"Bearer {expired_token(gw, tok, SECRET)}"}, timeout=5)
             check(r.status_code == 401 and r.json()["type"].endswith(":token-expired") and "X-Request-Id" in r.headers
                   and r.json()["instance"] == "/api/v2/echo/x",
-                  "expired AT → 401 token-expired (edition 4), instance = request path")
+                  "expired AT → 401 token-expired, instance = request path")
 
         # README § Data plane retry: dead is not listening → connect refused → retry on live; after 5 failures dead → suspect
         picks = []
@@ -1089,7 +1089,7 @@ async def scenario_fresh_worker(gw, tok, peer, peer_master):
         check(respawned == 3, f"the peer's master spawned fresh workers on every SIGHUP ({respawned}/3)")
         check(seen[404] == 0, f"no 404 from a fresh worker ({seen[404]})")
         check(all(ra == "1" for (st, ra, _), n in details.items() if st == 503), "every 503 carries Retry-After: 1")
-        # Contract edition 6, K7: "not loaded yet" has a slug of its own — a client branches on type, not on detail.
+        # "Not loaded yet" has a slug of its own — a client branches on type, not on detail.
         check(seen[503] > 0 and all(d.startswith("routes-loading:") for (st, _, d), n in details.items() if st == 503),
               f"every 503 of a fresh worker is routes-loading, not no-instance ({seen[503]} of them)")
         check(seen[200] > 0, "the instance is served through the peer between the reloads")
@@ -1449,7 +1449,7 @@ async def scenario_commands_relayed(gw, tok, peer, pg_dsn, pg_container):
 
 
 async def scenario_statement_lost(gw, tok, peer, pg_dsn, pg_container, peer_master):
-    print("16. connection lost with the statement in the server's hands: the pool sends it again (PgRetry::if_lost, T768)")
+    print("16. connection lost with the statement in the server's hands: the pool sends it again (PgRetry::if_lost)")
     if not peer or not pg_dsn or not pg_container or not peer_master:
         print("  [skip] needs --peer, --pg, --pg-container and --peer-master-pid")
         return
@@ -1662,7 +1662,7 @@ def route_of(gw, tok, path):
 
 
 async def scenario_register_before_load(gw, tok, peer, peer_master):
-    print("17. /register on a fresh worker before its first reload: close 1013, no CALLERROR; the 409 comes on the retry (T769)")
+    print("17. /register on a fresh worker before its first reload: close 1013, no CALLERROR; the 409 comes on the retry")
     if not peer or not peer_master:
         print("  [skip] needs --peer and --peer-master-pid")
         return
@@ -1724,7 +1724,7 @@ async def scenario_register_before_load(gw, tok, peer, peer_master):
 
 async def scenario_register_race(gw, tok, peer, pg_dsn, pg_container):
     print("18. two modules register overlapping prefixes on two workers at once: the earlier registration keeps "
-          "the prefix on both, the later one is closed 1008 (T769)")
+          "the prefix on both, the later one is closed 1008")
     if not peer or not pg_dsn or not pg_container:
         print("  [skip] needs --peer, --pg and --pg-container")
         return
@@ -1778,7 +1778,7 @@ async def scenario_register_race(gw, tok, peer, pg_dsn, pg_container):
 
 async def scenario_takeover_uncommitted(gw, tok, peer, pg_dsn):
     print("19. the same instance registers on the peer while this gateway's INSERT of it is not committed yet: "
-          "the takeover is journalled and this gateway closes the old socket 1001 at once, not at its next reload (T1211)")
+          "the takeover is journalled and this gateway closes the old socket 1001 at once, not at its next reload")
     if not peer or not pg_dsn:
         print("  [skip] needs --peer and --pg")
         return

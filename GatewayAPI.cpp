@@ -73,7 +73,7 @@ int int_or(const nlohmann::json& o, const char* key, int def)
 // The same for a string. A frame's fields are read through these two, not
 // json::value(): value() throws on a field of another type, and a frame is
 // handled in the socket's epoll callback, where an exception that escapes
-// ends the worker (T644).
+// ends the worker.
 std::string str_or(const nlohmann::json& o, const char* key, std::string def)
 {
     auto it = o.find(key);
@@ -441,13 +441,13 @@ void GatewayAPI::reply_problem(HttpResponse& resp, int status, std::string_view 
 
     // Every 401 the gateway answers itself — the data plane's refusals of
     // check_auth and the control plane's of check_gateway_token alike — is
-    // decided here, so no new call site can forget either half (T282):
+    // decided here, so no new call site can forget either half:
     //
     //   - RFC 6750 §3: a bearer resource's 401 carries the challenge. The host
     //     behind the gateway sets its own; these are answered before a request
     //     ever reaches it.
     //   - The catalogue id the go-platform host gives the same case, so one case
-    //     reads one code whichever producer refused it (T243, owner's word 2а).
+    //     reads one code whichever producer refused it.
     //     Every way a token fails to verify is one code: ERR-401-007 "signature
     //     is incorrect" would tell a prober which check it passed.
     //
@@ -587,7 +587,7 @@ void GatewayAPI::do_post(const HttpRequest& req, HttpResponse& resp)
 
     // Held elsewhere — by the table: an instance it does not know, or knows
     // offline, is not relayed; before the first reload the table knows only
-    // this worker's sockets, and a miss is not an answer yet (3в).
+    // this worker's sockets, and a miss is not an answer yet.
     const auto* known = find_instance(module, instance);
     if (!known || known->state == "offline") {
         if (!table_loaded_) {
@@ -823,7 +823,7 @@ void GatewayAPI::on_ws_message(const std::shared_ptr<Node>& node, uint8_t opcode
 
     // This runs in the socket's epoll callback, outside the HTTP dispatcher's
     // try: an exception that leaves it ends the worker process, every node
-    // and every HTTP call in flight on it (T644). Fields are read by type
+    // and every HTTP call in flight on it. Fields are read by type
     // (int_or/str_or), and whatever still throws below is answered, not
     // propagated. A catch does not cover a stack overflow: the depth is
     // bounded at parse, and p is moved out, not copied.
@@ -920,7 +920,7 @@ void GatewayAPI::on_reply(const std::shared_ptr<Node>& node, const json& msg)
 
     if (!call.answer) return;
     // The call is already out of pending: whatever happens below, the caller
-    // is answered here or never — nothing else will find it (T644). Fields
+    // is answered here or never — nothing else will find it. Fields
     // are read by type: c/m of another type must not throw past the answer.
     Answer a;
     if (t == 3) {
@@ -1009,8 +1009,8 @@ void GatewayAPI::handle_register(const std::shared_ptr<Node>& node, const std::s
 
     // Until the first reload this worker knows only its own sockets: a prefix
     // of another module registered on another worker would pass the check
-    // below and stay here for good (T769). Not a refusal of the module —
-    // no CALLERROR; close 1013 sends it to the common back-off (K2, K6), and
+    // below and stay here for good. Not a refusal of the module —
+    // no CALLERROR; close 1013 sends it to the common back-off, and
     // the table is loaded by the time it comes back (about a second).
     // A database still away after k_register_wait_s: the registration is
     // taken as before — the first reload settles a prefix held elsewhere —
@@ -1267,7 +1267,7 @@ void GatewayAPI::execute(const HttpRequest& req, std::shared_ptr<HttpConnection>
         // instance of another worker — a fresh worker (a restart by the
         // master, SIGHUP) would answer 404 for a second or two. Not yet known
         // is 503 + Retry-After, like a route with nothing ready — under a slug
-        // of its own, routes-loading (contract edition 6, K7): a client
+        // of its own, routes-loading: a client
         // branches on type, not on detail.
         if (covered || !table_loaded_)
             answer_problem(conn, ctx, 503, miss_slug(covered), "Service Unavailable", miss_detail(covered), req.path, request_id, /*retry_after=*/true);
@@ -1478,7 +1478,7 @@ std::string_view GatewayAPI::miss_detail(bool covered)
 }
 
 // Called only on a 503: covered → a route with nothing ready; not covered →
-// the table has not been read yet, so "no route" is not known (K7, ed. 6).
+// the table has not been read yet, so "no route" is not known.
 std::string_view GatewayAPI::miss_slug(bool covered)
 {
     return covered ? "no-instance" : "routes-loading";
@@ -1889,10 +1889,10 @@ void GatewayAPI::mirror_next()
     mirror_queue_.pop_front();
     auto what = w.what;
     // The pool queues a query while no connection is ready, and with
-    // PgRetry::if_lost sends one cut off by a lost connection again (T627) —
+    // PgRetry::if_lost sends one cut off by a lost connection again —
     // every mirror write is an upsert, a state set or a read that ends in the
     // same state the second time (a register's repeat journals one extra
-    // offline -> ready, as before T627); on_exception is then for an SQL
+    // offline -> ready); on_exception is then for an SQL
     // error only. With the database
     // away this write simply waits; heartbeat() notices the age of
     // mirror_sent_ and says so.
@@ -1902,7 +1902,7 @@ void GatewayAPI::mirror_next()
     // the next mirror_exec() retries it; on_fail is not called, the write is
     // not lost. Left busy, the mirror would stop for
     // the life of the worker: this used to be moot while any throw on a
-    // frame ended the worker, and is not since the frame handler catches (T644).
+    // frame ended the worker, and is not since the frame handler catches.
     // A throw after the pool has taken the query (add_io/modify_io failing
     // on ENOMEM and the like) would send this write twice; that is for
     // PgPool::execute to rule out, not for this queue.
@@ -1932,7 +1932,7 @@ void GatewayAPI::mirror_next()
 void GatewayAPI::mirror_upsert(const Instance& inst, std::string_view pre_reason, std::string_view reason, bool reassert)
 {
     // One writer of a (module, instance) row at a time, across workers and
-    // pods (T1211). Two registrations of one instance milliseconds apart on
+    // pods. Two registrations of one instance milliseconds apart on
     // two pods: the first INSERT is not committed yet, so the second
     // transaction's offline step sees no row and changes nothing, and its
     // ON CONFLICT waits for the first, then turns ready into ready — the
@@ -2067,7 +2067,7 @@ void GatewayAPI::mirror_reload()
         std::map<std::string, std::map<std::string, bool>> seen;   // (module, instance) present in the database
 
         // Who holds which prefix, as of this snapshot — the same answer on
-        // every worker (T769). Candidates: every live row of the snapshot —
+        // every worker. Candidates: every live row of the snapshot —
         // an own socket's current row stands for the socket and is judged on
         // the row, as every other worker judges it — and the own sockets the
         // snapshot does not show yet (no row, a row older than our /register,
@@ -2585,7 +2585,7 @@ void GatewayAPI::cmd_notify(std::string payload, std::function<void()> on_sent,
 {
     // Not through mirror_exec: nothing orders a command against the mirror,
     // and a queue stalled behind the database would hold it past its deadline.
-    // PgRetry::if_lost (T627, T768): a pg_notify cut off by a lost connection
+    // PgRetry::if_lost: a pg_notify cut off by a lost connection
     // may have committed — the holder may already have run the command. It is
     // sent again rather than reported: the holder drops a repeat by its id
     // (cmd_seen_) and a late one by its deadline, the requester takes the

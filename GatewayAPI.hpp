@@ -138,7 +138,7 @@ protected:
     /// refresh callback asynchronously — as the gateway's problem+json (README
     /// § Errors): invalid → 401 token-invalid, expired / database-401 → 401
     /// token-expired, the rest by status (refresh_failed is no longer produced
-    /// by AppServer — T307 — and still maps to token-expired for overrides).
+    /// by AppServer and still maps to token-expired for overrides).
     void reply_refused(HttpResponse& resp, const Refusal& refusal) override;
 
 private:
@@ -493,7 +493,7 @@ private:
     int                                   refused_quiet_{0};    // refusals not logged since
     // Set for the length of a reload's reconcile: module -> the prefixes its
     // live rows in the snapshot and this worker's own sockets hold, taken in
-    // the order of `registered` (T769). The cross-module check of
+    // the order of `registered`. The cross-module check of
     // mirror_refusal runs against it instead of table_, which still holds
     // instances the same snapshot shows gone.
     const std::map<std::string, std::vector<std::string>>* reload_claims_{nullptr};
@@ -503,7 +503,7 @@ private:
     bool mirror_busy_{false};
     bool          table_loaded_{false};   // a reload has succeeded (or k_reload_failures failed): a miss is a 404, not a 503
     // When this worker started: /register waits for the first reload (close
-    // 1013) no longer than k_register_wait_s after it (T769).
+    // 1013) no longer than k_register_wait_s after it.
     std::chrono::system_clock::time_point born_{std::chrono::system_clock::now()};
     static constexpr int k_register_wait_s = 10;
     static constexpr int k_reload_failures = 3;
